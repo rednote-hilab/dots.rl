@@ -101,7 +101,10 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
+    elif data_source in ['ifeval', 'ifeval_benchmark', 'ifeval_like_3w_v1']:
+        from .ifeavl import compute_score
 
+        res = compute_score(solution_str, ground_truth)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
