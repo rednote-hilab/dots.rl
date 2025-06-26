@@ -64,6 +64,7 @@ class MegatronPPOActor(BasePPOActor):
         tf_config,
         actor_module: nn.ModuleList,
         actor_optimizer: DistributedOptimizer,
+        tokenizer,
     ):
         """MeagtronPPOActor class. This class implements the simple PPO logics when the model is built with Megatron.
 
@@ -149,6 +150,7 @@ class MegatronPPOActor(BasePPOActor):
                 "reduce_grads_use_alltoall": False,
             }
         )
+        self.tokenizer = tokenizer
 
         config = get_model_config(self.actor_module[0])
         print(config)
@@ -532,17 +534,13 @@ class MegatronPPOActor(BasePPOActor):
                     ret["log_probs"] = log_probs
                     return ret
 
-                logits_processor_args = {"label": label, "label_mask": label_mask}
-                output = forward_fn(
-                    model,
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    sequence_parallel=self.tf_config.sequence_parallel,
-                    multi_modal_inputs=multi_modal_inputs,
-                    logits_processor=logits_processor,
-                    logits_processor_args=logits_processor_args,
-                )
+            logits_processor_args = {"label": label, "label_mask": label_mask}
+
+            from verl.models.mcore import get_mcore_forward_fn
+
+            forward_fn = get_mcore_forward_fn(self.hf_config)
+
+            output = forward_fn(model, input_ids, attention_mask, position_ids, sequence_parallel=self.tf_config.sequence_parallel, logits_processor=logits_processor, logits_processor_args=logits_processor_args)
 
             if forward_only:
                 meta_info = None

@@ -557,6 +557,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 tf_config=self.tf_config,
                 actor_module=self.actor_module,
                 actor_optimizer=self.actor_optimizer,
+                tokenizer=self.tokenizer,
             )
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
