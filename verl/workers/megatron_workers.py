@@ -584,6 +584,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 tf_config=self.tf_config,
                 actor_module=self.ref_module,
                 actor_optimizer=None,
+                tokenizer=self.tokenizer,
             )
             if self._ref_is_offload_param:
                 offload_megatron_model_to_cpu(self.ref_module)
@@ -592,6 +593,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
             self.checkpoint_mananager = MegatronCheckpointManager(
+                tf_config=self.tf_config,
                 config=self.config,
                 checkpoint_config=self.config.actor.checkpoint,
                 model_config=self.actor_model_config,
@@ -619,9 +621,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
+            log_gpu_memory_usage("Before load actor params and grad during update_actor", logger=logger)
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
+            log_gpu_memory_usage("Before load actor optimizer during update_actor", logger=logger)
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
@@ -1027,6 +1031,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         )
         self.flops_counter = FlopsCounter(self.critic_model_config)
         self.checkpoint_mananager = MegatronCheckpointManager(
+            tf_config=self.tf_config,
             config=self.config,
             checkpoint_config=self.config.checkpoint,
             model_config=self.critic_model_config,

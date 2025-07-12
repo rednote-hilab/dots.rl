@@ -18,6 +18,8 @@ import os
 import random
 from collections.abc import Callable
 from dataclasses import asdict
+from dataclasses import is_dataclass
+from argparse import Namespace
 
 import numpy as np
 import torch
@@ -101,6 +103,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     def __init__(
         self,
+        tf_config,
         config,
         checkpoint_config,
         model_config,
@@ -128,6 +131,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             checkpoint_config=checkpoint_config,
         )
         self.arch = arch
+        self.tf_config = tf_config
         self.config = config
         self.transformer_config = transformer_config
         self.role = role
