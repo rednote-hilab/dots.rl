@@ -21,10 +21,12 @@ import socket
 import hydra
 import ray
 from omegaconf import OmegaConf
+import time
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_async_pipeline_trainer import RayPPOAsyncPipelineTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
@@ -134,7 +136,15 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import Role
 
-        self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
+        if config.trainer.get("async_pipeline", False):
+            self.role_worker_mapping.update({
+                Role.Actor: ray.remote(actor_rollout_cls),
+                Role.RefPolicy: ray.remote(actor_rollout_cls),
+                Role.Rollout: ray.remote(actor_rollout_cls),
+                # Role.Critic: ray.remote(CriticWorker),
+            })
+        else:
+            self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
 
         return actor_rollout_cls, ray_worker_group_cls
 
@@ -165,12 +175,56 @@ class TaskRunner:
         """Initialize resource pool manager."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        self.mapping[Role.ActorRollout] = global_pool_id
-        self.mapping[Role.Critic] = global_pool_id
+        if config.trainer.get("async_pipeline", False):
+            global_pool_id = "global_pool"
+            actor_pool_id = "actor_pool"
+            ref_pool_id = "ref_pool"
+            rollout_pool_id = "rollout_pool"
+            # actor_pool_size = config.trainer.n_gpus_per_node * config.trainer.nnodes // 2
+            # 2x8 
+            # 0.25 0.25 0.5 -> 4+4+8
+            # [4], [4], [8]
+            # 
+            actor_pool_size = int(config.actor_rollout_ref.actor.use_nodes * config.trainer.n_gpus_per_node * config.trainer.nnodes)
+            ref_pool_size = int(config.actor_rollout_ref.ref.use_nodes * config.trainer.n_gpus_per_node * config.trainer.nnodes)
+            rollout_pool_size = int(config.actor_rollout_ref.rollout.use_nodes * config.trainer.n_gpus_per_node * config.trainer.nnodes)
+            def gen_pool_spec(pool_size):
+                """Generate a pool spec for the given pool size."""
+                nper_node = config.trainer.n_gpus_per_node
+                pool_nodes = pool_size // nper_node
+                if pool_nodes > 0 and pool_size != nper_node * pool_nodes:
+                    raise ValueError(f"Pool size {pool_size} must be a multiple of n_gpus_per_node {nper_node}. \
+                        or this setting will get poor performance.")
+                return [config.trainer.n_gpus_per_node] * pool_nodes if pool_nodes > 1 else [pool_size]
+        
+            # TODO: check hybrid actor/ref
+            hybrid_actor_ref = actor_pool_size == ref_pool_size
+            
+            resource_pool_spec = {
+                # TODO: node size;
+                actor_pool_id: gen_pool_spec(actor_pool_size),
+                rollout_pool_id: gen_pool_spec(rollout_pool_size),
+            }
+            if hybrid_actor_ref:
+                ref_pool_id = actor_pool_id
+            else:
+                resource_pool_spec[ref_pool_id] = gen_pool_spec(ref_pool_size)
+
+            self.mapping = {
+                Role.Actor: actor_pool_id,
+                Role.RefPolicy: ref_pool_id,
+                Role.Rollout: rollout_pool_id,
+                Role.Critic: actor_pool_id,
+            }
+
+        else:
+            global_pool_id = "global_pool"
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
+            self.mapping[Role.ActorRollout] = global_pool_id
+            self.mapping[Role.Critic] = global_pool_id
+
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -263,9 +317,13 @@ class TaskRunner:
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
-
-        # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        
+        ppo_trainer_class = RayPPOAsyncPipelineTrainer if config.trainer.get("async_pipeline", False) else RayPPOTrainer
+        if hasattr(ppo_trainer_class, '__name__'):
+            print(f"Using PPO trainer class: {ppo_trainer_class.__name__}")
+        else:
+            print(f"Using PPO trainer class: {ppo_trainer_class}")
+        trainer = ppo_trainer_class(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
@@ -283,6 +341,7 @@ class TaskRunner:
         trainer.init_workers()
         # Start the training process.
         trainer.fit()
+        print(f"Using PPO trainer fit done")
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):

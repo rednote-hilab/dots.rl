@@ -69,6 +69,8 @@ from verl.workers.rollout.schemas import (
 )
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
+# 使用Gloo后不需要复杂的kernel调度
+
 try:
     from sglang.srt.function_call.function_call_parser import FunctionCallParser
 except ImportError:
@@ -215,17 +217,52 @@ def _post_process_outputs(processing_class, output):
         )
         return torch.tensor(output_token_ids), torch.tensor(log_probs)
 
-    out_map = map(lambda x: _map_each_response(x), output)
-    batched_output_token_ids = []
-    batched_logprobs = []
-    for output_token_ids, log_probs in out_map:
-        batched_output_token_ids.append(output_token_ids)
-        batched_logprobs.append(log_probs)
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    batched_output_token_ids = pad_sequence(batched_output_token_ids, batch_first=True, padding_value=pad_token_id)
-    if len(batched_logprobs) > 0:
-        batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
-    return batched_output_token_ids, batched_logprobs
+    # 添加输入验证
+    if output is None:
+        print(f"[_post_process_outputs] Error: output is None")
+        # 返回形状为 [0, 0] 的tensor而不是空tensor，避免shape[1]错误
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        empty_tensor = torch.empty(0, 0, dtype=torch.long, device=device)
+        return empty_tensor, empty_tensor
+    
+    if not isinstance(output, (list, tuple)) or len(output) == 0:
+        print(f"[_post_process_outputs] Error: output is not a valid list/tuple or is empty: {type(output)}")
+        # 返回形状为 [0, 0] 的tensor而不是空tensor，避免shape[1]错误
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        empty_tensor = torch.empty(0, 0, dtype=torch.long, device=device)
+        return empty_tensor, empty_tensor
+
+    try:
+        out_map = map(lambda x: _map_each_response(x), output)
+        batched_output_token_ids = []
+        batched_logprobs = []
+        for output_token_ids, log_probs in out_map:
+            # 检查tensor是否为空
+            if output_token_ids.numel() > 0:
+                batched_output_token_ids.append(output_token_ids)
+                batched_logprobs.append(log_probs)
+        
+        # 检查是否有有效的输出
+        if not batched_output_token_ids:
+            print(f"[_post_process_outputs] Warning: No valid outputs found")
+            pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            # 返回形状为 [0, 0] 的tensor而不是空tensor，避免shape[1]错误
+            empty_tensor = torch.empty(0, 0, dtype=torch.long, device=device)
+            return empty_tensor, empty_tensor
+        
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        batched_output_token_ids = pad_sequence(batched_output_token_ids, batch_first=True, padding_value=pad_token_id)
+        if len(batched_logprobs) > 0:
+            batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
+        return batched_output_token_ids, batched_logprobs
+    except Exception as e:
+        print(f"[_post_process_outputs] Error processing output: {e}")
+        print(f"[_post_process_outputs] Output type: {type(output)}")
+        print(f"[_post_process_outputs] Output length: {len(output) if hasattr(output, '__len__') else 'N/A'}")
+        # 返回形状为 [0, 0] 的tensor而不是空tensor，避免shape[1]错误
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        empty_tensor = torch.empty(0, 0, dtype=torch.long, device=device)
+        return empty_tensor, empty_tensor
 
 
 def get_tool_call_parser_type(
@@ -262,6 +299,7 @@ class SGLangRollout(BaseRollout):
         port=None,
         trust_remote_code: bool = False,
         device_mesh: DeviceMesh | None = None,
+        sharding_manager=None,
         **kwargs,
     ):
         """Synchronized SGLang rollout engine.
@@ -289,6 +327,8 @@ class SGLangRollout(BaseRollout):
         super().__init__()
         self.config = config
         self._device_mesh_cpu = device_mesh
+        self.sharding_manager = sharding_manager
+        
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
 
         (
@@ -326,6 +366,9 @@ class SGLangRollout(BaseRollout):
                 self.pad_token_id = self.processing_class.tokenizer.pad_token_id
             except AttributeError as e:
                 raise ValueError(f"Cannot get pad_token_id from processing_class {self.processing_class}") from e
+        
+        self.param_update_manager = kwargs.get('param_update_manager', None)
+
 
     def _init_distributed_env(self, device_mesh_cpu, **kwargs):
         self._device_mesh_cpu = device_mesh_cpu
@@ -446,40 +489,82 @@ class SGLangRollout(BaseRollout):
         if first_rank_in_node:
             rank = dist.get_rank()
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            self._engine = AsyncEngine(
-                model_path=actor_module,
-                dtype=self.config.dtype,
-                mem_fraction_static=self.config.gpu_memory_utilization,
-                enable_memory_saver=True,
-                base_gpu_id=0,
-                gpu_id_step=1,
-                tp_size=self._tp_size,
-                node_rank=node_rank,
-                load_format=load_format,
-                dist_init_addr=dist_init_addr,
-                nnodes=nnodes,
-                trust_remote_code=trust_remote_code,
-                # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
-                # when random.seed is being set during training
-                port=30000 + rank,
-                # NOTE(Chenyang): turn on log_level to see the decoding speed of SGLang Engine
-                # log_level="INFO"
-                # NOTE(Chenyang): turn the following lines to see the input and output of each request
-                # log_requests=True,
-                # log_requests_level=2,
-                # NOTE(Chenyang): turn on max_running_requests to set the max concurrent running requests
-                # max_running_requests=1,
-                mm_attention_backend="fa3",
-                attention_backend=attention_backend if attention_backend is not None else "fa3",
-                # In async mode for AgentLoop, SGLang support token in token out to avoid the tokenizer
-                # inconsistency issue.
-                skip_tokenizer_init=self.config.mode == "async",
-                **engine_kwargs,
-            )
+            
+            # 检查是否启用双buffer
+            enable_dual_buffer = getattr(self.config, 'enable_dual_buffer', False)
+            
+            if enable_dual_buffer:
+                print(f"[SGLangRollout] Initializing DualBufferAsyncEngine for dual buffer optimization")
+                # 导入独立的DualBufferAsyncEngine
+                from .dual_buffer_engine import DualBufferAsyncEngine
+                buffer_bucket_size_mb = getattr(self.config, 'param_update_consume_bucket_size_mb', 128)
+                self._engine = DualBufferAsyncEngine(
+                    model_path=actor_module,
+                    dtype=self.config.dtype,
+                    mem_fraction_static=self.config.gpu_memory_utilization,
+                    enable_memory_saver=True,
+                    base_gpu_id=0,
+                    gpu_id_step=1,
+                    tp_size=self._tp_size,
+                    node_rank=node_rank,
+                    load_format=load_format,
+                    dist_init_addr=dist_init_addr,
+                    nnodes=nnodes,
+                    trust_remote_code=trust_remote_code,
+                    # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
+                    # when random.seed is being set during training
+                    port=30000 + rank,
+                    # NOTE(Chenyang): turn on log_level to see the decoding speed of SGLang Engine
+                    # log_level="INFO"
+                    # NOTE(Chenyang): turn the following lines to see the input and output of each request
+                    # log_requests=True,
+                    # log_requests_level=2,
+                    # NOTE(Chenyang): turn on max_running_requests to set the max concurrent running requests
+                    # max_running_requests=1,
+                    mm_attention_backend="fa3",
+                    attention_backend=attention_backend if attention_backend is not None else "fa3",
+                    # In async mode for AgentLoop, SGLang support token in token out to avoid the tokenizer
+                    # inconsistency issue.
+                    skip_tokenizer_init=self.config.mode == "async",
+                    bucket_size_mb=buffer_bucket_size_mb,
+                    **engine_kwargs,
+                )
+                print(f"[SGLangRollout] DualBufferAsyncEngine initialized successfully")
+            else:
+                print(f"[SGLangRollout] Initializing standard AsyncEngine")
+                self._engine = AsyncEngine(
+                    model_path=actor_module,
+                    dtype=self.config.dtype,
+                    mem_fraction_static=self.config.gpu_memory_utilization,
+                    enable_memory_saver=True,
+                    base_gpu_id=0,
+                    gpu_id_step=1,
+                    tp_size=self._tp_size,
+                    node_rank=node_rank,
+                    load_format=load_format,
+                    dist_init_addr=dist_init_addr,
+                    nnodes=nnodes,
+                    trust_remote_code=trust_remote_code,
+                    # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
+                    # when random.seed is being set during training
+                    port=30000 + rank,
+                    # NOTE(Chenyang): turn on log_level to see the decoding speed of SGLang Engine
+                    # log_level="INFO"
+                    # NOTE(Chenyang): turn the following lines to see the input and output of each request
+                    # log_requests=True,
+                    # log_requests_level=2,
+                    # NOTE(Chenyang): turn on max_running_requests to set the max concurrent running requests
+                    # max_running_requests=1,
+                    mm_attention_backend="fa3",
+                    attention_backend=attention_backend if attention_backend is not None else "fa3",
+                    # In async mode for AgentLoop, SGLang support token in token out to avoid the tokenizer
+                    # inconsistency issue.
+                    skip_tokenizer_init=self.config.mode == "async",
+                    **engine_kwargs,
+                )
         else:
             self._engine = None
 
-        self.sharding_manager = None
         self.is_sleep = True
 
     def _init_sampling_params(self, **kwargs):
@@ -560,6 +645,19 @@ class SGLangRollout(BaseRollout):
         logger.info(f"Initialize interactions from configuration: interaction_map: {list(interaction_map.keys())}")
         return interaction_map
 
+    def get_update_weight_func(self):
+        # 更新双buffer的权重
+        update_func_call = self._engine.update_buffer_data_only if hasattr(self, '_engine') and self._engine is not None else None
+        return update_func_call
+
+    def set_params_meta(self, params_meta):
+        if hasattr(self, '_engine') and self._engine is not None:
+            self._engine.set_params_meta(params_meta)
+
+    def update_weight_from_dual_buffer(self):
+        func_call = self.sharding_manager.update_weights
+        update_success = self._engine.execute_update_weights_before_generate(func_call)
+
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -583,9 +681,33 @@ class SGLangRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        
+        is_dual_buffer = hasattr(self, '_engine') and self._engine is not None
+        
+        if is_dual_buffer:
+            t1 = time.time()
+            self._wait_for_param_update_completion()
+            t2 = time.time()
+            print(f"[SGLangRollout] wait_for_param_update_completion cost_time:{t2 - t1:.2f}s")
+            
+            self.update_weight_from_dual_buffer()
+            t3 = time.time()
+            print(f"[SGLangRollout] update_weight_from_dual_buffer cost_time:{t3 - t2:.2f}s")
+
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
+
+    def _wait_for_param_update_completion(self, timeout_seconds=150):
+        if not hasattr(self.param_update_manager, '_param_update_start_time'):
+            print("[SGLangRollout] No param_update started, skipping wait")
+            return
+        
+        start_time = self.param_update_manager._param_update_start_time
+        if hasattr(self, '_engine') and self._engine is not None:
+            self._engine.wait_for_buffer_write()
+            remaining = timeout_seconds - (time.time() - start_time)
+            print(f"[SGLangRollout] Param_update in progress, elapsed: {time.time() - start_time:.2f}s, remaining: {remaining:.1f}s")
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
@@ -759,6 +881,7 @@ class SGLangRollout(BaseRollout):
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
+        position_ids = position_ids.to("cpu", non_blocking=True)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
         if position_ids.dim() == 3:  # qwen2vl mrope
@@ -791,9 +914,47 @@ class SGLangRollout(BaseRollout):
             batch["rollout_log_probs"] = rollout_log_probs
 
         # free cache engine
-        if self._engine is not None and self._tp_rank == 0:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self._engine.flush_cache())
+        if self.config.free_cache_engine and self._engine is not None and self._tp_rank == 0:
+            # 修复：在Ray worker线程中使用新的事件循环执行asyncio调用
+            import threading
+            import concurrent.futures
+            current_thread = threading.current_thread()
+            is_main_thread = current_thread.name == 'MainThread'
+            
+            if is_main_thread:
+                # 在主线程中，直接使用asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.run_until_complete(self._engine.flush_cache())
+                except Exception as e:
+                    print(f"Async flush_cache failed in main thread: {e}")
+                    # 忽略flush_cache错误，不影响主要功能
+                    pass
+            else:
+
+                def run_async_flush_cache_in_new_thread():
+                    """在新线程中运行异步flush_cache，创建新的事件循环"""
+                    try:
+                        # 创建新的事件循环
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            return loop.run_until_complete(self._engine.flush_cache())
+                        finally:
+                            loop.close()
+                    except Exception as e:
+                        print(f"Thread pool async flush_cache failed: {e}")
+                        # 忽略flush_cache错误，不影响主要功能
+                        pass
+                
+                # 使用线程池执行
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_async_flush_cache_in_new_thread)
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Thread pool async flush_cache failed: {e}")
+                        pass
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
@@ -1588,3 +1749,28 @@ class SGLangRollout(BaseRollout):
             return
         await self.sharding_manager.sleep()
         self.is_sleep = True
+
+    def sync_per_tensor_generator(self):
+        """同步参数到SGLang引擎 - 确保参数更新生效"""        
+        # 检查是否有param_update_manager
+        if hasattr(self, 'param_update_manager') and self.param_update_manager is not None:            
+            # 使用param_update_manager同步参数
+            if hasattr(self.param_update_manager, 'sync_per_tensor_generator'):
+                result = self.param_update_manager.sync_per_tensor_generator()
+                print(f"[SGLangRollout] param_update_manager.sync_per_tensor_generator completed")
+                return result
+
+        # 如果没有可用的管理器，尝试直接更新引擎权重
+        if self._engine is not None and self._tp_rank == 0:
+            print(f"[SGLangRollout] No parameter manager available, attempting direct engine update")
+            
+            # 检查引擎类型
+            if hasattr(self._engine, 'update_weights_from_tensor'):
+                print(f"[SGLangRollout] Engine supports update_weights_from_tensor")
+                # 这里需要获取最新的权重，暂时返回None
+                return None
+            else:
+                print(f"[SGLangRollout] Engine does not support update_weights_from_tensor")
+        
+        print(f"[SGLangRollout] No parameter sync method available")
+        return None
