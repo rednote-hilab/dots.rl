@@ -37,7 +37,6 @@ from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     RayClassWithInitArgs,
-    AsyncLLMServerManager,
     Role,
     OmegaConf,
     create_colocated_worker_cls,
@@ -45,7 +44,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
-    _timer,
+    marked_timer,
     compute_advantage,
     compute_response_mask,
     agg_loss,
@@ -208,7 +207,7 @@ class RolloutStateMachine(BaseRoleStateMachine):
         # Need to repeat preprocessing part
         _gen_batch = self.trainer._pre_process_batch(batch)
         
-        with _timer("step", timing_raw):
+        with marked_timer("step", timing_raw):
             batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
             # repeat to align with repeated responses in rollout
             batch = batch.repeat(repeat_times=self.trainer.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -372,12 +371,12 @@ class TrainStateMachine(BaseRoleStateMachine):
         
         is_last_step = self.trainer.global_steps >= self.trainer.total_training_steps
         
-        with _timer("step", timing_raw):
+        with marked_timer("step", timing_raw):
             # Acquire resource lock (for training phase)
             await resource_lock.acquire("train", self.trainer.global_steps)
 
             # recompute old_log_probs
-            with _timer("old_log_prob", timing_raw):
+            with marked_timer("old_log_prob", timing_raw):
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 loss_agg_mode = self.trainer.config.actor_rollout_ref.actor.loss_agg_mode
@@ -415,16 +414,16 @@ class TrainStateMachine(BaseRoleStateMachine):
             
             if self.trainer.use_reference_policy:
                 # compute reference log_prob
-                with _timer("ref", timing_raw):
+                with marked_timer("ref", timing_raw):
                     batch = batch.union(ref_log_prob)
 
             # compute values; TODO support async-rl
             if self.trainer.use_critic:
-                with _timer("values", timing_raw):
+                with marked_timer("values", timing_raw):
                     values = self.critic_wg.compute_values(batch)
                     batch = batch.union(values)
 
-            with _timer("adv", timing_raw):
+            with marked_timer("adv", timing_raw):
                 batch.batch["token_level_scores"] = reward_tensor
 
                 if reward_extra_infos_dict:
@@ -448,15 +447,12 @@ class TrainStateMachine(BaseRoleStateMachine):
                     lam=self.trainer.config.algorithm.lam,
                     num_repeat=self.trainer.config.actor_rollout_ref.rollout.n,
                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                    multi_turn=self.trainer.config.actor_rollout_ref.rollout.multi_turn.enable,
-                    use_pf_ppo=self.trainer.config.algorithm.use_pf_ppo,
-                    pf_ppo_reweight_method=self.trainer.config.algorithm.pf_ppo.reweight_method,
-                    pf_ppo_weight_pow=self.trainer.config.algorithm.pf_ppo.weight_pow,
+                    config=self.trainer.config.algorithm,
                 )
 
             # update critic
             if self.trainer.use_critic:
-                with _timer("update_critic", timing_raw):
+                with marked_timer("update_critic", timing_raw):
                     critic_output = self.critic_wg.update_critic(batch)
                 critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                 metrics.update(critic_output_metrics)
@@ -464,7 +460,7 @@ class TrainStateMachine(BaseRoleStateMachine):
             # implement critic warmup
             if self.trainer.config.trainer.critic_warmup <= self.trainer.global_steps:
                 # update actor
-                with _timer("update_actor", timing_raw):
+                with marked_timer("update_actor", timing_raw):
                     batch.meta_info["multi_turn"] = self.trainer.config.actor_rollout_ref.rollout.multi_turn.enable
                     actor_output = self.trainer.actor_wg.update_actor(batch)
 
@@ -474,7 +470,7 @@ class TrainStateMachine(BaseRoleStateMachine):
             # Log rollout generations if enabled
             rollout_data_dir = self.trainer.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
-                with _timer("dump_rollout_generations", timing_raw):
+                with marked_timer("dump_rollout_generations", timing_raw):
                     print(batch.batch.keys())
                     inputs = self.trainer.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                     outputs = self.trainer.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
@@ -488,7 +484,7 @@ class TrainStateMachine(BaseRoleStateMachine):
                     )
 
             if self.trainer.config.trainer.save_freq > 0 and (is_last_step or self.trainer.global_steps % self.trainer.config.trainer.save_freq == 0):
-                with _timer("save_checkpoint", timing_raw):
+                with marked_timer("save_checkpoint", timing_raw):
                     worker = self.trainer.actor_rollout_wg if "actor_rollout" in self.trainer.resource_pool_to_cls else self.trainer.actor_wg
                     self.trainer._save_checkpoint(worker)
 

@@ -395,7 +395,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         from megatron.core.models.gpt.gpt_model import ModelType
 
         from verl.utils.megatron.optimizer import get_megatron_optimizer
-        from verl.utils.megatron_utils import get_model, init_megatron_optim_config
+        from verl.utils.megatron_utils import get_model
         from verl.utils.model import get_generation_config, print_model_size
 
         from verl.utils.megatron.optimizer import (
@@ -411,7 +411,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             override_model_config,
             override_transformer_config,
             self.config.model.get("trust_remote_code", False),
-            self.config.actor.megatron.use_mbridge,
+            self.config.actor.megatron.use_mbridge if hasattr(self.config.actor.megatron, "use_mbridge") else False,
         )
         self.generation_config = get_generation_config(self.local_path)
 
@@ -718,6 +718,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
         else:
             override_transformer_config = {}
+            override_ddp_config = {}
+
         self.param_dtype = torch.bfloat16
         log_gpu_memory_usage("Before init actor model and optimizer", logger=logger)
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
@@ -1022,7 +1024,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # asyncio.run(_async_generate(input_queue, output_queue))
         await _async_generate(input_queue, output_queue)
 
-    @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
     @DistProfiler.annotate(color="olive")
     def compute_ref_log_prob(self, data: DataProto):
@@ -1250,7 +1252,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
             override_model_config,
             override_transformer_config,
             self.config.model.get("trust_remote_code", False),
-            self.config.megatron.use_mbridge,
+            self.config.megatron.use_mbridge if hasattr(self.config.megatron, "use_mbridge") else False,
         )
 
         wrap_config = McoreModuleWrapperConfig(
@@ -1516,7 +1518,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
             override_model_config,
             override_transformer_config,
             self.config.model.get("trust_remote_code", False),
-            self.config.megatron.use_mbridge,
+            self.config.megatron.use_mbridge if hasattr(self.config.megatron, "use_mbridge") else False,
         )
 
         wrap_config = McoreModuleWrapperConfig(

@@ -492,7 +492,8 @@ class McoreToHFWeightConverterXdgMoE(McoreToHFWeightConverterBase):
             convert_names.append(f"model.layers.{layer_number}.self_attn.q_proj.{param_type}")
             convert_names.append(f"model.layers.{layer_number}.self_attn.k_proj.{param_type}")
             convert_names.append(f"model.layers.{layer_number}.self_attn.v_proj.{param_type}")
-            assert len(params) == 3
+            # AssertionError: Expected 3 params, got 1 for decoder.layers.0.self_attention.linear_qkv.weight, 0, weight
+            assert len(params) == 3, f"Expected 3 params, got {len(params)} for {name}, {layer_number}, {param_type}"
         elif "self_attention.linear_proj.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.self_attn.o_proj.weight")
             assert len(params) == 1

@@ -368,7 +368,7 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
-        if config.critic.enable is not None:
+        if hasattr(config.critic, 'enable') and config.critic.enable is not None:
             self.use_critic = bool(config.critic.enable)
         elif self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
@@ -522,7 +522,7 @@ class RayPPOTrainer:
 
             collate_fn = default_collate_fn
 
-        num_workers = self.config.data["dataloader_num_workers"]
+        num_workers = self.config.data.get("dataloader_num_workers", 8)
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,

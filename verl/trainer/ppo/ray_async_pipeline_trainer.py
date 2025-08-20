@@ -23,7 +23,6 @@ from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     RayClassWithInitArgs,
-    AsyncLLMServerManager,
     Role,
     OmegaConf,
     create_colocated_worker_cls,
@@ -31,7 +30,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
-    _timer,
+    marked_timer,
     compute_advantage,
     compute_response_mask,
     agg_loss,
@@ -144,7 +143,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
 
         # breakpoint()
         
-        async_pipline_init = self.config.actor_rollout_ref.get("async_pipeline_init", True)
+        async_pipline_init = self.config.trainer.get("async_pipeline", False)
         
         _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         atexit.register(_executor.shutdown, wait=True)
@@ -259,6 +258,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
             self.async_rollout_mode = True
+            from verl.workers.rollout.async_server import AsyncLLMServerManager
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_rollout_wg,
@@ -308,6 +308,10 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
         )
+        
+        # repeat in trainer
+        if self.config.actor_rollout_ref.rollout.n > 1:
+            _gen_batch = _gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
         return _gen_batch
 
     def get_next_batch(self):
@@ -459,7 +463,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
             
             # if self.use_reference_policy:
             #     # compute reference log_prob
-            #     with _timer("ref", timing_raw):
+            #     with marked_timer("ref", timing_raw):
             #         if not self.ref_in_actor:
             #             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
             #         else:
@@ -476,7 +480,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
 
             batch = await self._async_pipeline.pull(src_role="train", dst_role="reward")
 
-            # with _timer("reward", timing_raw):
+            # with marked_timer("reward", timing_raw):
             # compute reward model score
             if self.use_rm:
                 reward_tensor = self.rm_wg.compute_rm_score(batch)
@@ -570,9 +574,9 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
                 
                 is_last_step = self.global_steps >= self.total_training_steps
                 
-                with _timer("step", timing_raw):
+                with marked_timer("step", timing_raw):
                     # async rollout in the background
-                    with _timer("gen", timing_raw):
+                    with marked_timer("gen", timing_raw):
                         # get the batch from the queue
                         gen_batch_output = await self._async_pipeline.pull(src_role="rollout", dst_role="train")
 
@@ -593,7 +597,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     
-                    with _timer("reward", timing_raw):
+                    with marked_timer("reward", timing_raw):
                         if self._async_pipeline.is_in_pipeline("reward"):
                             
                             await self._async_pipeline.push("train", "reward", batch)
@@ -619,7 +623,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
                             await self._async_pipeline.push(src_role="train", dst_role="ref_logp", data=batch)     
 
                     # recompute old_log_probs
-                    with _timer("old_log_prob", timing_raw):
+                    with marked_timer("old_log_prob", timing_raw):
                         if not self._async_pipeline.is_in_pipeline("logp"):
                             # old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             old_log_prob = self.actor_wg.compute_log_prob(batch)
@@ -661,7 +665,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
                     
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        with _timer("ref", timing_raw):
+                        with marked_timer("ref", timing_raw):
                             if self._async_pipeline.is_in_pipeline("ref_logp"):
                                 ref_log_prob = await self._async_pipeline.pull(src_role="ref_logp", dst_role="train")
                             else:
@@ -674,11 +678,11 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
 
                     # compute values
                     if self.use_critic:
-                        with _timer("values", timing_raw):
+                        with marked_timer("values", timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    with _timer("adv", timing_raw):
+                    with marked_timer("adv", timing_raw):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self._async_pipeline.is_in_pipeline("reward"):
@@ -719,7 +723,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
 
                     # update critic
                     if self.use_critic:
-                        with _timer("update_critic", timing_raw):
+                        with marked_timer("update_critic", timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
@@ -727,7 +731,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
-                        with _timer("update_actor", timing_raw):
+                        with marked_timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             # print(f"batch_size:{batch.batch.batch_size[0]}")
                             
@@ -742,7 +746,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        with _timer("dump_rollout_generations", timing_raw):
+                        with marked_timer("dump_rollout_generations", timing_raw):
                             print(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
@@ -757,14 +761,14 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
 
                     # # validate
                     # if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
-                    #     with _timer("testing", timing_raw):
+                    #     with marked_timer("testing", timing_raw):
                     #         val_metrics: dict = self._validate()
                     #         if is_last_step:
                     #             last_val_metrics = val_metrics
                     #     metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                        with _timer("save_checkpoint", timing_raw):
+                        with marked_timer("save_checkpoint", timing_raw):
                             worker = self.actor_rollout_wg if "actor_rollout" in self.resource_pool_to_cls else self.actor_wg
                             self._save_checkpoint(worker)
 

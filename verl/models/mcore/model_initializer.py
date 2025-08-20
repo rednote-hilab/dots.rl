@@ -18,7 +18,7 @@
 import inspect
 from abc import ABC, abstractmethod
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 from .config_converter import PretrainedConfig, TransformerConfig
@@ -190,6 +190,7 @@ class DeepseekV3Model(BaseModelInitializer):
         # MTP
         if self.tfconfig.mtp_num_layers is not None and self.tfconfig.mtp_num_layers > 0:
             transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
+            from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
             mtp_block_spec = get_gpt_mtp_block_spec(self.tfconfig, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
             kwargs["mtp_block_spec"] = mtp_block_spec
 

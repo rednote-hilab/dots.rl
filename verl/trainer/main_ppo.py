@@ -58,7 +58,7 @@ def run_ppo(config) -> None:
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         default_runtime_env = get_ppo_ray_runtime_env()
-        ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
+        ray_init_kwargs = config.ray_kwargs.get("ray_init", {}) if hasattr(config, "ray_kwargs") else {}
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
@@ -69,6 +69,7 @@ def run_ppo(config) -> None:
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
     if (
         is_cuda_available
+        and hasattr(config, "global_profiler")
         and config.global_profiler.tool == "nsys"
         and config.global_profiler.get("steps") is not None
         and len(config.global_profiler.get("steps", [])) > 0
@@ -180,14 +181,17 @@ class TaskRunner:
             actor_pool_id = "actor_pool"
             ref_pool_id = "ref_pool"
             rollout_pool_id = "rollout_pool"
-            # actor_pool_size = config.trainer.n_gpus_per_node * config.trainer.nnodes // 2
             # 2x8 
             # 0.25 0.25 0.5 -> 4+4+8
             # [4], [4], [8]
-            # 
-            actor_pool_size = int(config.actor_rollout_ref.actor.use_nodes * config.trainer.n_gpus_per_node * config.trainer.nnodes)
-            ref_pool_size = int(config.actor_rollout_ref.ref.use_nodes * config.trainer.n_gpus_per_node * config.trainer.nnodes)
-            rollout_pool_size = int(config.actor_rollout_ref.rollout.use_nodes * config.trainer.n_gpus_per_node * config.trainer.nnodes)
+            # trainer.use_nodes_ratios=[0.5,0.5,0.5,0.5] 
+            # means: train/logp/ref_logp use 0.5 ngpus, generate use 0.5 ngpus
+            total_use_nodes_ratio = config.trainer.use_nodes_ratios
+            total_ngpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+            actor_use_nodes_ratio, logp_use_nodes_ratio, ref_use_nodes_ratio, rollout_use_nodes_ratio = total_use_nodes_ratio
+            actor_pool_size = int(actor_use_nodes_ratio * total_ngpus)
+            ref_pool_size = int(ref_use_nodes_ratio * total_ngpus)
+            rollout_pool_size = int(rollout_use_nodes_ratio * total_ngpus)
             def gen_pool_spec(pool_size):
                 """Generate a pool spec for the given pool size."""
                 nper_node = config.trainer.n_gpus_per_node
@@ -407,7 +411,7 @@ def create_rl_sampler(data_config, dataset):
     import torch
     from torch.utils.data import RandomSampler, SequentialSampler
 
-    if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
+    if hasattr(data_config, 'sampler') and data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
         curriculum_class = load_extern_type(
             data_config.sampler.class_path,
             data_config.sampler.class_name,

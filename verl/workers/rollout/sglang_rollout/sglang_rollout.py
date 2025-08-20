@@ -156,6 +156,12 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
     async def update_weights_from_tensor(self, update_weights_request: UpdateWeightsFromTensorReqInput):
         return await self.tokenizer_manager.update_weights_from_tensor(update_weights_request, None)
 
+    async def update_weights_from_reqinput(
+        self,
+        obj: UpdateWeightsFromTensorReqInput,
+    ):
+        return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
+
     async def flush_cache(self):
         return await self.tokenizer_manager.flush_cache()
 
@@ -670,7 +676,6 @@ class SGLangRollout(BaseRollout):
         if hasattr(self, '_engine') and self._engine is not None:
             self._engine.wait_for_buffer_write()
             remaining = timeout_seconds - (time.time() - start_time)
-            print(f"[SGLangRollout] Param_update in progress, elapsed: {time.time() - start_time:.2f}s, remaining: {remaining:.1f}s")
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()

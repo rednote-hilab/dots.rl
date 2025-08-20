@@ -331,29 +331,26 @@ class ParamUpdateManager:
         # Ensure _params_meta is initialized
         if not hasattr(self, '_params_meta') or self._params_meta is None:
             self._params_meta = []
-        
-        try:
-            for key, tensor in per_tensor_param:
-                if tensor is not None:
-                    meta = {
-                        "name": key,
-                        "shape": tensor.shape,
-                        "dtype": tensor.dtype,
-                        "size": tensor.numel() * tensor.element_size(),
-                    }
-                    self._params_meta.append(meta)
-                else:
-                    # Handle None tensor
-                    meta = {
-                        "name": key,
-                        "shape": (),
-                        "dtype": torch.float32,
-                        "size": 0,
-                    }
-                    self._params_meta.append(meta)
-        except Exception as e:
-            enhanced_print("param_update", None, f"Error processing tensor metadata: {e}")
-            return []
+    
+        for key, tensor in per_tensor_param:
+            if tensor is not None:
+                meta = {
+                    "name": key,
+                    "shape": tensor.shape,
+                    "dtype": tensor.dtype,
+                    "size": tensor.numel() * tensor.element_size(),
+                }
+                self._params_meta.append(meta)
+            else:
+                # Handle None tensor
+                meta = {
+                    "name": key,
+                    "shape": (),
+                    "dtype": torch.float32,
+                    "size": 0,
+                }
+                self._params_meta.append(meta)
+
         
         enhanced_print("param_update", None, f"Generated {len(self._params_meta)} parameter metadata entries using bucketed generator")
         return self._params_meta

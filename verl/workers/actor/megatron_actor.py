@@ -123,7 +123,7 @@ class MegatronPPOActor(BasePPOActor):
         self.tf_config = tf_config
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
-        self.use_torch_profiler = self.config.profiler.get("tool") == "torch"
+        self.use_torch_profiler = hasattr(self.config, "profiler") and self.config.profiler.get("tool") == "torch"
         if self.use_torch_profiler:
             self.prof = Profiler(
                 self.config.profiler, tool_config=self.config.profiler.get("tool_config", {}).get("torch", {})

@@ -1024,7 +1024,7 @@ def per_tensor_generator_bucketed(actor_module, model_config, weight_converter, 
                     else:
                         params = [param]
 
-                    merge_params = default_tp_concat_fn(layer_name_mapping, expert_name, broad_pp_tensor, params, model_config, convert_qkv_gate_up_by_simple_split)
+                    merge_params = default_tp_concat_fn(layer_name_mapping, expert_name, broad_pp_tensor, params, model_config, weight_converter.hf_config, convert_qkv_gate_up_by_simple_split)
                     if not isinstance(merge_params, list):
                         merge_params = [merge_params]
                     converted_names, converted_params = weight_converter.convert_param(expert_name, merge_params)
@@ -1040,7 +1040,7 @@ def per_tensor_generator_bucketed(actor_module, model_config, weight_converter, 
                 else:
                     infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(all_gather_group_size)]
                     torch.distributed.all_gather(infer_params, broad_pp_tensor, group=mpu.get_tensor_model_parallel_group())
-                infer_params = default_tp_concat_fn(layer_name_mapping, name, broad_pp_tensor, infer_params, model_config, convert_qkv_gate_up_by_simple_split)
+                infer_params = default_tp_concat_fn(layer_name_mapping, name, broad_pp_tensor, infer_params, model_config, weight_converter.hf_config, convert_qkv_gate_up_by_simple_split)
             else:
                 infer_params = broad_pp_tensor
 
