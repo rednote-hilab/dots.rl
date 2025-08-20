@@ -169,7 +169,6 @@ class RolloutStateMachine(BaseRoleStateMachine):
     
     async def get_input_data(self) -> Optional[Any]:
         """Block getting dataloader; wait for generate data to arrive"""
-        import asyncio
 
         data = await self.pipeline.pull("dataloader", "rollout")
 
@@ -964,22 +963,22 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
 
 
 class GenerateStateMachine(BaseRoleStateMachine):
-    """asyncRLgenerationstate machine - 支持可interruptgeneration"""
+    """asyncRLgenerationstate machine"""
     
     def __init__(self, pipeline, trainer):
         super().__init__("generate", pipeline)
         self.trainer = trainer
-        self.first_generation = True  # 标记是否为第一次generation
+        self.first_generation = True
         
-        # 配置generate与param_update的距离
-        self.generate_ahead_steps = trainer.config.trainer.get("generate_ahead_steps", 3)  # 增加默认值
-        self.last_param_update_step = 0  # 记录最后一个param_update的step
+        # set offpolicy steps: generate ahead param_update
+        self.generate_ahead_steps = trainer.config.trainer.get("generate_ahead_steps", 3)
+        self.last_param_update_step = 0
 
         enhanced_print("generate", None, f"Configured generate ahead: {self.generate_ahead_steps} steps")
 
     @timing_decorator("generate")
     async def process_data(self, data: Any) -> Any:
-        """Processgenerationlogic - 后台线程execute"""
+        """Processgenerationlogic"""
         if data == "END":
             return "END"
         elif data is None:
@@ -989,7 +988,6 @@ class GenerateStateMachine(BaseRoleStateMachine):
         step, gen_batch = data
         enhanced_print("generate", None, f"Starting generation task for step {step}")
         
-        # 在后台线程中executegeneration，不阻塞主流程
         generation_task = asyncio.create_task(
             asyncio.to_thread(self._generate_sync, gen_batch, step)
         )
@@ -999,11 +997,10 @@ class GenerateStateMachine(BaseRoleStateMachine):
         
         enhanced_print("generate", None, f"Generation task created for step {step}")
         
-        # return任务对象，让send_output_datawaitingcompleted
         return (step, generation_task)
 
     async def send_output_data(self, data: Any) -> bool:
-        """sendgenerationresults - waitingasync任务completed后push"""
+        """sendgenerationresults"""
         if data == "END":
             enhanced_print("generate", None, "Sending END signal to rollout")
             await self.pipeline.push("generate", "rollout", PIPELINE_END_SIGNAL)
@@ -1011,12 +1008,10 @@ class GenerateStateMachine(BaseRoleStateMachine):
         elif data is None:
             return False
         
-        # 检查是否是任务对象
         if isinstance(data, tuple) and len(data) == 2:
             step, generation_task = data
             enhanced_print("generate", None, f"Waiting for background generation task to complete for step {step}")
             
-            # waiting后台任务completed
             gen_batch_output = await generation_task
             if gen_batch_output is None:
                 raise Exception(f"Generation failed for step {step}")
@@ -1024,10 +1019,8 @@ class GenerateStateMachine(BaseRoleStateMachine):
             enhanced_print("generate", None, f"Background generation completed for step {step}")
 
         else:
-            # Process其他情况
             step, gen_batch_output = data
         
-        # unified在这里Processpush操作
         enhanced_print("generate", None, f"Sending generation result to rollout for step {step}")
         await self.pipeline.push("generate", "rollout", (step, gen_batch_output))
         enhanced_print("generate", None, f"Generation result sent to rollout for step {step}")
@@ -1035,11 +1028,10 @@ class GenerateStateMachine(BaseRoleStateMachine):
         return True
     
     async def get_input_data(self) -> Optional[Any]:
-        """gettinggenerationdata - 只在距离过大时才waitingparam_update"""        
-        # 第一次generation时需要waitingparam_updatecompleted，确保有可用的权重
+        """gettinggenerationdata"""        
+        # first generation need waiting param_update completed
         if self.first_generation:
             enhanced_print("generate", None, "First generation, waiting for initial param_update to complete...")
-            # 第一个step时，必须waitingparam_updatecompleted
             param_update_signal = await self.pipeline.pull("param_update", "generate")
             
             if param_update_signal == PIPELINE_END_SIGNAL:
@@ -1048,12 +1040,11 @@ class GenerateStateMachine(BaseRoleStateMachine):
             elif param_update_signal is None:
                 return None
             
-            # update最后一个param_update的step
             self.last_param_update_step = param_update_signal
             enhanced_print("generate", None, f"First generation: received param_update completion signal for step {param_update_signal}")
             self.first_generation = False
         
-        # waitingdataloader的data
+        # waiting dataloader
         data = await self.pipeline.pull("dataloader", "generate")
         
         if data == PIPELINE_END_SIGNAL:
@@ -1068,10 +1059,10 @@ class GenerateStateMachine(BaseRoleStateMachine):
             
         step, gen_batch = data
         
-        # 检查generate与param_update的距离，如果太远则Block waitingparam_update来updatelast_param_update_step
+        # Check the distance between generate and param_update. 
+        # If it is too far, Blocking to waiting param_update.
         while step >= self.last_param_update_step + self.generate_ahead_steps:
             enhanced_print("generate", None, f"Step {step} is too far ahead of param_update {self.last_param_update_step}, waiting for next param_update...")
-            # waiting下一个param_updatecompleted来updatelast_param_update_step
             param_update_signal = await self.pipeline.pull("param_update", "generate")
             
             if param_update_signal == PIPELINE_END_SIGNAL:
@@ -1080,7 +1071,6 @@ class GenerateStateMachine(BaseRoleStateMachine):
             elif param_update_signal is None:
                 return None
             
-            # update最后一个param_update的step
             self.last_param_update_step = param_update_signal
             enhanced_print("generate", None, f"Updated param_update step to {param_update_signal}")
         
@@ -1088,30 +1078,24 @@ class GenerateStateMachine(BaseRoleStateMachine):
         return (step, gen_batch)
     
     def _generate_sync(self, gen_batch, step: int):
-        """synchronizationgeneration函数 - 在后台线程中execute"""
-        try:
-            enhanced_print("generate", None, f"Background generation started for step {step}")
-            
-            start_time = time.time()
-            
-            # executegeneration
-            wg = self.trainer.rollout_wg
-            gen_batch_output = wg.generate_sequences_sperated(gen_batch)
-            
-            generation_time = time.time() - start_time
-            
-            enhanced_print("generate", None, f"Background generation completed for step {step} in {generation_time:.3f}s")
-            
-            return gen_batch_output
-            
-        except Exception as e:
-            enhanced_print("generate", None, f"Error in background generation for step {step}: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        """synchronization generation"""
+        enhanced_print("generate", None, f"Background generation started for step {step}")
+        
+        start_time = time.time()
+        
+        # executegeneration
+        wg = self.trainer.rollout_wg
+        gen_batch_output = wg.generate_sequences_sperated(gen_batch)
+        
+        generation_time = time.time() - start_time
+        
+        enhanced_print("generate", None, f"Background generation completed for step {step} in {generation_time:.3f}s")
+        
+        return gen_batch_output
+
 
     def get_status_info(self) -> Dict[str, Any]:
-        """getting详细状态信息"""
+        """getting detailed status information"""
         async_rl_stats = {}
         return {
             "type": "async_rl_generate",
@@ -1123,12 +1107,12 @@ class GenerateStateMachine(BaseRoleStateMachine):
 
 def create_role_state_machine(role_name: str, pipeline, trainer, use_async_rl: bool = False) -> BaseRoleStateMachine:
     """
-    创建角色state machine工厂函数
+    Create a role state machine factory function
     
     Args:
-        role_name: 角色名称
-        pipeline: pipeline实例
-        trainer: trainer实例  
+        role_name: role name, e.g., "dataloader", "rollout", "reward", "param_update", "generate", "logp", "ref_logp", "train"
+        pipeline: pipeline instance
+        trainer: trainer instance
         use_async_rl: Whether to use async RL optimization (default False)
     """
     state_machines = {
