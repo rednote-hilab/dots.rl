@@ -400,8 +400,6 @@ class RayWorkerGroup(WorkerGroup):
                     "RAY_LOCAL_RANK": str(local_rank),
                     "MASTER_ADDR": self._master_addr,
                     "MASTER_PORT": self._master_port,
-                    # NCCL
-                    "NCCL_P2P_DISABLE": "1" if os.environ.get("WORLD_SIZE", "1") == "1" else "0",
                 }
                 if worker_env is not None:
                     logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")

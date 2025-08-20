@@ -49,6 +49,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 
+
 __all__ = ["MegatronPPOActor"]
 
 logger = logging.getLogger(__file__)
@@ -185,6 +186,9 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
             DataProto: torch.Tensor: the log_prob tensor
         """
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+
         data.to(get_device_id())
         data.batch = data.batch.contiguous()
         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)

@@ -233,13 +233,13 @@ class AsyncPipeline:
         use_queue_name = f"{src_role}_to_{dst_role}"
         if debug_log:
             enhanced_print(src_role, dst_role, f"[{src_role}] Pushing data to [{dst_role}] queue: {use_queue_name}")
-        
+
         # Get current node information
         current_node_id = str(ray.get_runtime_context().node_id)
         
         # Record start time
         start_time = time.time()
-        
+
         if self.transfer_mode == TransferMode.DIRECT_OBJECT_STORE:
             # Bypass queue, directly use object store
             if use_queue_name not in self._object_store_pairs:
@@ -256,10 +256,10 @@ class AsyncPipeline:
             total_time = time.time() - start_time
             
             # Record performance analysis
-            if total_time > 0.1:
+            if debug_log and total_time > 0.1:
                 enhanced_print(src_role, dst_role, f"DIRECT OBJECT STORE: {use_queue_name} ray_put={ray_put_time:.3f}s, total={total_time:.3f}s, refs_count={len(self._object_store_pairs[use_queue_name])}")
             
-            if total_time > 1.0:
+            if debug_log and total_time > 1.0:
                 enhanced_print(src_role, dst_role, f"⚠️ SLOW DIRECT PUT: {use_queue_name} took {total_time:.2f}s (ray_put: {ray_put_time:.2f}s) on node={current_node_id[:8]}")
         else:
             # Use Ray queue
@@ -285,10 +285,10 @@ class AsyncPipeline:
                 queue_size_after = cur_pipeline_queue.qsize()
                 
                 # Record performance analysis
-                if total_time > 0.1:
+                if debug_log and total_time > 0.1:
                     enhanced_print(src_role, dst_role, f"RAY_PUT OPTIMIZATION: {use_queue_name} ray_put={ray_put_time:.3f}s, queue_put={queue_put_time:.3f}s, total={total_time:.3f}s, queue={queue_size_before}->{queue_size_after}, node={current_node_id[:8]}")
                 
-                if total_time > 1.0:
+                if debug_log and total_time > 1.0:
                     enhanced_print(src_role, dst_role, f"⚠️ SLOW RAY_PUT: {use_queue_name} took {total_time:.2f}s (ray_put: {ray_put_time:.2f}s, queue_put: {queue_put_time:.2f}s) on node={current_node_id[:8]}")
             elif self.transfer_mode == TransferMode.RAY_QUEUE_COMPRESSED:
                 # Original method: compression + queue transfer
@@ -311,11 +311,10 @@ class AsyncPipeline:
                 queue_size_after = cur_pipeline_queue.qsize()
                 
                 # Detailed analysis of put_async performance, including node information
-                if put_time > 0.1:  # Record if over 100ms
+                if debug_log and put_time > 0.1:  # Record if over 100ms
                     enhanced_print(src_role, dst_role, f"PUT_ASYNC ANALYSIS: {use_queue_name} put_async={put_time:.3f}s, compress={compress_time:.3f}s, total={total_time:.3f}s, queue={queue_size_before}->{queue_size_after}")
                 
-                # Print warning if total time exceeds 1 second
-                if total_time > 1.0:
+                if debug_log and total_time > 1.0:
                     enhanced_print(src_role, dst_role, f"⚠️ SLOW PUSH: {use_queue_name} took {total_time:.2f}s (put_async: {put_time:.2f}s, compress: {compress_time:.2f}s) on node={current_node_id[:8]}")
             else: # RAY_QUEUE mode
                 # Original method: compression + queue transfer
@@ -333,10 +332,10 @@ class AsyncPipeline:
                 total_time = time.time() - compress_start
                 queue_size_after = cur_pipeline_queue.qsize()
                 
-                if put_time > 0.1:
+                if debug_log and put_time > 0.1:
                     enhanced_print(src_role, dst_role, f"PUT_ASYNC ANALYSIS: {use_queue_name} put_async={put_time:.3f}s, compress={compress_time:.3f}s, total={total_time:.3f}s, queue={queue_size_before}->{queue_size_after}")
                 
-                if total_time > 1.0:
+                if debug_log and total_time > 1.0:
                     enhanced_print(src_role, dst_role, f"⚠️ SLOW PUSH: {use_queue_name} took {total_time:.2f}s (put_async: {put_time:.2f}s, compress: {compress_time:.2f}s) on node={current_node_id[:8]}")
         
         return True

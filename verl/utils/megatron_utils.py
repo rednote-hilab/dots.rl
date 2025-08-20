@@ -416,6 +416,50 @@ def load_megatron_model_to_gpu(models, load_grad=True):
 
 
 @torch.no_grad()
+def offload_megatron_model_grad_to_cpu(models):
+    """
+    In megatron, the model and optimizer storage are:
+    - bf16 parameter data chunked in model parallel group
+    - fp32 grad chunked in model parallel group
+    - fp32 main_parameter chunked in model and dp group
+    - fp32 optimizer state chunked in model and dp group
+    """
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
+            for buffers in model_chunk_all_buffers:
+                for buffer in buffers:
+                    if buffer.grad_data.storage().size() > 0:
+                        # if the grad_data size is already zero, we assume that it is already offloaded
+                        buffer.grad_data_size = buffer.grad_data.storage().size()
+                        buffer.grad_data.storage().resize_(0)
+        else:
+            # we need this for ref module
+            for _, param in model_chunk.named_parameters():
+                if param.grad is not None:
+                    param.grad = param.grad.to("cpu", non_blocking=True)
+    gc.collect()
+    get_torch_device().empty_cache()
+
+@torch.no_grad()
+def load_megatron_model_grad_to_gpu(models):
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
+            for buffers in model_chunk_all_buffers:
+                for buffer in buffers:
+                    buffer.grad_data.storage().resize_(buffer.grad_data_size)
+                    buffer.grad_data.zero_()
+        else:
+            # we need this for ref module
+            device_id = get_device_id()
+            for _, param in model_chunk.named_parameters():
+                if param.grad is not None:
+                    param.grad = param.grad.to(device_id, non_blocking=True)
+    gc.collect()
+    get_torch_device().empty_cache()
+
+@torch.no_grad()
 def offload_megatron_copy_params(optimizers):
     """
     Offload optimizer parameters to CPU. Supports both Megatron optimizers

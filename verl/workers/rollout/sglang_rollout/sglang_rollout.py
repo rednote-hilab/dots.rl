@@ -22,7 +22,7 @@ import os
 import time
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, Optional
+from typing import Any, Optional, List, Tuple
 from uuid import uuid4
 
 import numpy as np
@@ -37,6 +37,7 @@ from sglang.srt.managers.tokenizer_manager import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     assert_pkg_version,
     get_ip,
     get_open_port,
@@ -155,6 +156,21 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
 
     async def update_weights_from_tensor(self, update_weights_request: UpdateWeightsFromTensorReqInput):
         return await self.tokenizer_manager.update_weights_from_tensor(update_weights_request, None)
+
+    async def update_weights_from_tensor_legacy(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],  # noqa: UP006
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+        to avoid duplicated cache cleaning operation."""
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.tp_size)],
+            load_format=load_format,
+            flush_cache=flush_cache,
+        )
+        return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
 
     async def update_weights_from_reqinput(
         self,
@@ -460,10 +476,8 @@ class SGLangRollout(BaseRollout):
         if first_rank_in_node:
             rank = dist.get_rank()
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            
-            # 检查是否启用双buffer
+
             enable_dual_buffer = getattr(self.config, 'enable_dual_buffer', False)
-            
             if enable_dual_buffer:
                 print(f"[SGLangRollout] Initializing DualBufferAsyncEngine for dual buffer optimization")
                 from .dual_buffer_engine import DualBufferAsyncEngine
@@ -652,16 +666,10 @@ class SGLangRollout(BaseRollout):
         """
         
         is_dual_buffer = hasattr(self, '_engine') and self._engine is not None
-        
-        if is_dual_buffer:
-            t1 = time.time()
+        enable_dual_buffer = getattr(self.config, 'enable_dual_buffer', False)
+        if enable_dual_buffer and is_dual_buffer:
             self._wait_for_param_update_completion()
-            t2 = time.time()
-            print(f"[SGLangRollout] wait_for_param_update_completion cost_time:{t2 - t1:.2f}s")
-            
             self.update_weight_from_dual_buffer()
-            t3 = time.time()
-            print(f"[SGLangRollout] update_weight_from_dual_buffer cost_time:{t3 - t2:.2f}s")
 
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)

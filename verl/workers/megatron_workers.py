@@ -48,8 +48,10 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
+    load_megatron_model_grad_to_gpu,
     load_megatron_optimizer,
     offload_megatron_model_to_cpu,
+    offload_megatron_model_grad_to_cpu,
     offload_megatron_optimizer,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -742,6 +744,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
                 log_gpu_memory_usage("After offload actor params and grad during init", logger=logger)
+            elif self._is_offload_grad:
+                offload_megatron_model_grad_to_cpu(self.actor_module)
+                log_gpu_memory_usage("After offload actor params grad during init", logger=logger)
             if self._is_offload_optimizer:
                 offload_megatron_optimizer(self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
@@ -829,6 +834,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("Before load actor params and grad during update_actor", logger=logger)
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
+        elif self._is_offload_grad:
+            log_gpu_memory_usage("Before load actor params during update_actor", logger=logger)
+            load_megatron_model_grad_to_gpu(self.actor_module)
+            log_gpu_memory_usage("After load actor params during update_actor", logger=logger)
         if self._is_offload_optimizer:
             log_gpu_memory_usage("Before load actor optimizer during update_actor", logger=logger)
             load_megatron_optimizer(self.actor_optimizer)
@@ -861,6 +870,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
+        elif self._is_offload_grad:
+            offload_megatron_model_grad_to_cpu(self.actor_module)
+            log_gpu_memory_usage("After offload actor params during update_actor", logger=logger)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
@@ -1002,7 +1014,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = output.to("cpu")
 
         # clear kv cache
-        torch.cuda.empty_cache()
+        aggressive_empty_cache(force_sync=True)
         return output
 
     @register(dispatch_mode=Dispatch.ALL_TO_ALL, blocking=False)
@@ -1032,6 +1044,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._ref_is_offload_param:
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
             log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob", logger=logger)
+
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
@@ -1051,7 +1064,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue")
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
-        
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
