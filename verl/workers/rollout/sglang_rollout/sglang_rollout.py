@@ -22,7 +22,7 @@ import os
 import time
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, Optional
+from typing import Any, Optional, List, Tuple
 from uuid import uuid4
 
 import numpy as np
@@ -37,6 +37,7 @@ from sglang.srt.managers.tokenizer_manager import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     assert_pkg_version,
     get_ip,
     get_open_port,
@@ -156,6 +157,27 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
     async def update_weights_from_tensor(self, update_weights_request: UpdateWeightsFromTensorReqInput):
         return await self.tokenizer_manager.update_weights_from_tensor(update_weights_request, None)
 
+    async def update_weights_from_tensor_legacy(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],  # noqa: UP006
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+        to avoid duplicated cache cleaning operation."""
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.tp_size)],
+            load_format=load_format,
+            flush_cache=flush_cache,
+        )
+        return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
+
+    async def update_weights_from_reqinput(
+        self,
+        obj: UpdateWeightsFromTensorReqInput,
+    ):
+        return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
+
     async def flush_cache(self):
         return await self.tokenizer_manager.flush_cache()
 
@@ -219,14 +241,16 @@ def _post_process_outputs(processing_class, output):
     batched_output_token_ids = []
     batched_logprobs = []
     for output_token_ids, log_probs in out_map:
-        batched_output_token_ids.append(output_token_ids)
-        batched_logprobs.append(log_probs)
+        # 检查tensor是否为空
+        if output_token_ids.numel() > 0:
+            batched_output_token_ids.append(output_token_ids)
+            batched_logprobs.append(log_probs)
+
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     batched_output_token_ids = pad_sequence(batched_output_token_ids, batch_first=True, padding_value=pad_token_id)
     if len(batched_logprobs) > 0:
         batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
     return batched_output_token_ids, batched_logprobs
-
 
 def get_tool_call_parser_type(
     processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
@@ -262,6 +286,7 @@ class SGLangRollout(BaseRollout):
         port=None,
         trust_remote_code: bool = False,
         device_mesh: DeviceMesh | None = None,
+        sharding_manager=None,
         **kwargs,
     ):
         """Synchronized SGLang rollout engine.
@@ -289,6 +314,8 @@ class SGLangRollout(BaseRollout):
         super().__init__()
         self.config = config
         self._device_mesh_cpu = device_mesh
+        self.sharding_manager = sharding_manager
+        
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
 
         (
@@ -326,6 +353,9 @@ class SGLangRollout(BaseRollout):
                 self.pad_token_id = self.processing_class.tokenizer.pad_token_id
             except AttributeError as e:
                 raise ValueError(f"Cannot get pad_token_id from processing_class {self.processing_class}") from e
+        
+        self.param_update_manager = kwargs.get('param_update_manager', None)
+
 
     def _init_distributed_env(self, device_mesh_cpu, **kwargs):
         self._device_mesh_cpu = device_mesh_cpu
@@ -446,40 +476,79 @@ class SGLangRollout(BaseRollout):
         if first_rank_in_node:
             rank = dist.get_rank()
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            self._engine = AsyncEngine(
-                model_path=actor_module,
-                dtype=self.config.dtype,
-                mem_fraction_static=self.config.gpu_memory_utilization,
-                enable_memory_saver=True,
-                base_gpu_id=0,
-                gpu_id_step=1,
-                tp_size=self._tp_size,
-                node_rank=node_rank,
-                load_format=load_format,
-                dist_init_addr=dist_init_addr,
-                nnodes=nnodes,
-                trust_remote_code=trust_remote_code,
-                # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
-                # when random.seed is being set during training
-                port=30000 + rank,
-                # NOTE(Chenyang): turn on log_level to see the decoding speed of SGLang Engine
-                # log_level="INFO"
-                # NOTE(Chenyang): turn the following lines to see the input and output of each request
-                # log_requests=True,
-                # log_requests_level=2,
-                # NOTE(Chenyang): turn on max_running_requests to set the max concurrent running requests
-                # max_running_requests=1,
-                mm_attention_backend="fa3",
-                attention_backend=attention_backend if attention_backend is not None else "fa3",
-                # In async mode for AgentLoop, SGLang support token in token out to avoid the tokenizer
-                # inconsistency issue.
-                skip_tokenizer_init=self.config.mode == "async",
-                **engine_kwargs,
-            )
+
+            enable_dual_buffer = getattr(self.config, 'enable_dual_buffer', False)
+            if enable_dual_buffer:
+                print(f"[SGLangRollout] Initializing DualBufferAsyncEngine for dual buffer optimization")
+                from .dual_buffer_engine import DualBufferAsyncEngine
+                buffer_bucket_size_mb = getattr(self.config, 'param_update_consume_bucket_size_mb', 128)
+                self._engine = DualBufferAsyncEngine(
+                    model_path=actor_module,
+                    dtype=self.config.dtype,
+                    mem_fraction_static=self.config.gpu_memory_utilization,
+                    enable_memory_saver=True,
+                    base_gpu_id=0,
+                    gpu_id_step=1,
+                    tp_size=self._tp_size,
+                    node_rank=node_rank,
+                    load_format=load_format,
+                    dist_init_addr=dist_init_addr,
+                    nnodes=nnodes,
+                    trust_remote_code=trust_remote_code,
+                    # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
+                    # when random.seed is being set during training
+                    port=30000 + rank,
+                    # NOTE(Chenyang): turn on log_level to see the decoding speed of SGLang Engine
+                    # log_level="INFO"
+                    # NOTE(Chenyang): turn the following lines to see the input and output of each request
+                    # log_requests=True,
+                    # log_requests_level=2,
+                    # NOTE(Chenyang): turn on max_running_requests to set the max concurrent running requests
+                    # max_running_requests=1,
+                    mm_attention_backend="fa3",
+                    attention_backend=attention_backend if attention_backend is not None else "fa3",
+                    # In async mode for AgentLoop, SGLang support token in token out to avoid the tokenizer
+                    # inconsistency issue.
+                    skip_tokenizer_init=self.config.mode == "async",
+                    bucket_size_mb=buffer_bucket_size_mb,
+                    **engine_kwargs,
+                )
+                print(f"[SGLangRollout] DualBufferAsyncEngine initialized successfully")
+            else:
+                print(f"[SGLangRollout] Initializing standard AsyncEngine")
+                self._engine = AsyncEngine(
+                    model_path=actor_module,
+                    dtype=self.config.dtype,
+                    mem_fraction_static=self.config.gpu_memory_utilization,
+                    enable_memory_saver=True,
+                    base_gpu_id=0,
+                    gpu_id_step=1,
+                    tp_size=self._tp_size,
+                    node_rank=node_rank,
+                    load_format=load_format,
+                    dist_init_addr=dist_init_addr,
+                    nnodes=nnodes,
+                    trust_remote_code=trust_remote_code,
+                    # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
+                    # when random.seed is being set during training
+                    port=30000 + rank,
+                    # NOTE(Chenyang): turn on log_level to see the decoding speed of SGLang Engine
+                    # log_level="INFO"
+                    # NOTE(Chenyang): turn the following lines to see the input and output of each request
+                    # log_requests=True,
+                    # log_requests_level=2,
+                    # NOTE(Chenyang): turn on max_running_requests to set the max concurrent running requests
+                    # max_running_requests=1,
+                    mm_attention_backend="fa3",
+                    attention_backend=attention_backend if attention_backend is not None else "fa3",
+                    # In async mode for AgentLoop, SGLang support token in token out to avoid the tokenizer
+                    # inconsistency issue.
+                    skip_tokenizer_init=self.config.mode == "async",
+                    **engine_kwargs,
+                )
         else:
             self._engine = None
 
-        self.sharding_manager = None
         self.is_sleep = True
 
     def _init_sampling_params(self, **kwargs):
@@ -560,6 +629,18 @@ class SGLangRollout(BaseRollout):
         logger.info(f"Initialize interactions from configuration: interaction_map: {list(interaction_map.keys())}")
         return interaction_map
 
+    def get_update_weight_func(self):
+        update_func_call = self._engine.update_buffer_data_only if hasattr(self, '_engine') and self._engine is not None else None
+        return update_func_call
+
+    def set_params_meta(self, params_meta):
+        if hasattr(self, '_engine') and self._engine is not None:
+            self._engine.set_params_meta(params_meta)
+
+    def update_weight_from_dual_buffer(self):
+        func_call = self.sharding_manager.update_weights
+        update_success = self._engine.execute_update_weights_before_generate(func_call)
+
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -583,9 +664,26 @@ class SGLangRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        
+        is_dual_buffer = hasattr(self, '_engine') and self._engine is not None
+        enable_dual_buffer = getattr(self.config, 'enable_dual_buffer', False)
+        if enable_dual_buffer and is_dual_buffer:
+            self._wait_for_param_update_completion()
+            self.update_weight_from_dual_buffer()
+
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
+
+    def _wait_for_param_update_completion(self, timeout_seconds=150):
+        if not hasattr(self.param_update_manager, '_param_update_start_time'):
+            print("[SGLangRollout] No param_update started, skipping wait")
+            return
+        
+        start_time = self.param_update_manager._param_update_start_time
+        if hasattr(self, '_engine') and self._engine is not None:
+            self._engine.wait_for_buffer_write()
+            remaining = timeout_seconds - (time.time() - start_time)
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
@@ -759,6 +857,7 @@ class SGLangRollout(BaseRollout):
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
+        position_ids = position_ids.to("cpu", non_blocking=True)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
         if position_ids.dim() == 3:  # qwen2vl mrope
@@ -791,9 +890,30 @@ class SGLangRollout(BaseRollout):
             batch["rollout_log_probs"] = rollout_log_probs
 
         # free cache engine
-        if self._engine is not None and self._tp_rank == 0:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self._engine.flush_cache())
+        if self.config.free_cache_engine and self._engine is not None and self._tp_rank == 0:
+            import threading
+            import concurrent.futures
+            current_thread = threading.current_thread()
+            is_main_thread = current_thread.name == 'MainThread'
+            
+            if is_main_thread:
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(self._engine.flush_cache())
+            else:
+                def run_async_flush_cache_in_new_thread():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        return loop.run_until_complete(self._engine.flush_cache())
+                    finally:
+                        loop.close()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_async_flush_cache_in_new_thread)
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Thread pool async flush_cache failed: {e}")
+                        pass
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
@@ -1588,3 +1708,11 @@ class SGLangRollout(BaseRollout):
             return
         await self.sharding_manager.sleep()
         self.is_sleep = True
+
+    def sync_per_tensor_generator(self):
+        if hasattr(self, 'param_update_manager') and self.param_update_manager is not None:            
+            if hasattr(self.param_update_manager, 'sync_per_tensor_generator'):
+                result = self.param_update_manager.sync_per_tensor_generator()
+                print(f"[SGLangRollout] param_update_manager.sync_per_tensor_generator completed")
+                return result
+

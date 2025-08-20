@@ -15,6 +15,7 @@ import inspect
 import logging
 import socket
 from copy import deepcopy
+import os
 from typing import Any, Optional
 
 import ray
@@ -553,12 +554,25 @@ class RayWorkerGroup(WorkerGroup):
         Returns:
             Remote object reference to the method execution
         """
-        if self.fused_worker_used and method_name not in self.method_names:
+        if self.fused_worker_used:
+            # Prefer direct call if exposed on fused worker; otherwise use fused dispatch
+            if hasattr(worker, method_name):
+                remote_call = getattr(worker, method_name)
+                return remote_call.remote(*args, **kwargs)
             remote_call = getattr(worker, self.fused_worker_execute_fn_name)
             return remote_call.remote(f"{self.sub_cls_name}_fwmn_{method_name}", *args, **kwargs)
         # fused worker not used
-        remote_call = getattr(worker, method_name)
-        return remote_call.remote(*args, **kwargs)
+        if hasattr(worker, method_name):
+            remote_call = getattr(worker, method_name)
+            return remote_call.remote(*args, **kwargs)
+        # Try role-prefixed name as bound in WorkerDict (e.g., 'rollout_generate_sequences')
+        for prefix in ("rollout", "actor", "critic", "reward"):
+            cand = f"{prefix}_{method_name}"
+            if hasattr(worker, cand):
+                remote_call = getattr(worker, cand)
+                return remote_call.remote(*args, **kwargs)
+        # No matching method found; raise explicit error
+        raise AttributeError(f"ActorHandle has no method '{method_name}' or any of {[p+'_'+method_name for p in ('rollout','actor','critic','reward')]}.")
 
     def execute_rank_zero_sync(self, method_name: str, *args, **kwargs):
         """Execute a method on rank zero worker synchronously.
@@ -654,6 +668,28 @@ class RayWorkerGroup(WorkerGroup):
                 return result
 
         return [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
+
+    def execute_all_stream(self, method_name: str, *args, **kwargs):
+        """Execute a method on all workers and yield results as they complete.
+        This is non-blocking per-worker and preserves completion order.
+        """
+        refs = self.execute_all_async(method_name, *args, **kwargs)
+        remaining = list(range(len(refs)))
+        ref_list = list(refs)
+        while remaining:
+            done, pending = ray.wait(ref_list, num_returns=1, timeout=None)
+            if not done:
+                break
+            done_ref = done[0]
+            idx = ref_list.index(done_ref)
+            try:
+                result = ray.get(done_ref)
+            except Exception as e:
+                result = e
+            yield idx, result
+            # remove from lists
+            ref_list.pop(idx)
+            remaining.pop(idx)
 
     @property
     def master_address(self):

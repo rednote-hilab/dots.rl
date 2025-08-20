@@ -140,6 +140,9 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_user_turns: null
 
+  max_turns: null
+  enable_tokenization_sanity_check: True
+
   # max parallel call for tools in single turn
   max_parallel_calls: 1
 

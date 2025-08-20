@@ -47,6 +47,8 @@ class MultiTurnConfig(BaseConfig):
     max_assistant_turns: Optional[int] = None
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
+    max_turns: Optional[int] = None
+    enable_tokenization_sanity_check: bool = True
     max_parallel_calls: int = 1
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"
@@ -102,7 +104,13 @@ class RolloutConfig(BaseConfig):
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
     tensor_model_parallel_size: int = 2
+    pipeline_model_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
+    
+    # add by async-rl
+    enable_dual_buffer: bool = False
+    param_update_preduce_bucket_size_mb: int = 512
+    param_update_consume_bucket_size_mb: int = 128
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)

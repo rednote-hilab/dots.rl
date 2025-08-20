@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+BaseInferenceContext = None
+PackedSeqParams = None
 from megatron.core.transformer.attention import *
 
 from .rope_utils import apply_rotary_pos_emb_absolute

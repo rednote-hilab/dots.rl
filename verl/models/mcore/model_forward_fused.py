@@ -20,7 +20,10 @@ from typing import Optional
 import torch
 from megatron.core import parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.inference.contexts import BaseInferenceContext
+try:
+    from megatron.core.inference.contexts import BaseInferenceContext
+except Exception:
+    BaseInferenceContext = None
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region

@@ -18,13 +18,14 @@ import os
 import random
 from collections.abc import Callable
 from dataclasses import asdict
+from dataclasses import is_dataclass
+from argparse import Namespace
 
 import numpy as np
 import torch
 import torch.distributed
 from megatron.core import mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.transformer.enums import AttnBackend
 from transformers import GenerationConfig
 
 from verl.models.weight_loader_registry import get_weight_saver
@@ -101,6 +102,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     def __init__(
         self,
+        tf_config,
         config,
         checkpoint_config,
         model_config,
@@ -128,6 +130,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             checkpoint_config=checkpoint_config,
         )
         self.arch = arch
+        self.tf_config = tf_config
         self.config = config
         self.transformer_config = transformer_config
         self.role = role
@@ -436,6 +439,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 # Save transformer config
                 print(self.transformer_config)
                 transformer_config_dict = asdict(self.transformer_config)
+                from megatron.core.transformer.enums import AttnBackend
                 to_convert_types = {torch.dtype: str, AttnBackend: str}
                 ignore_types = [Callable]
                 pop_keys = []
