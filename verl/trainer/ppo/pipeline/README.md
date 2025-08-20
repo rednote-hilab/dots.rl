@@ -148,21 +148,21 @@ Loading   Generation   Rollout   Log Probs   Rewards   Model    Params
 
 ```python
 # Async RL Configuration
-trainer.async_pipeline=True
-
++actor_rollout_ref.async_pipeline=True \
+ 
 # Resource Management
-share_resource_between_train_logp_ref_logp: bool = True
-trainer.use_nodes_ratios=[0.5,0.5,0.5,0.5]
++trainer.use_nodes_ratios=[0.5,0.5,0.5,0.5] \
 # means: train/logp/ref_logp use 0.5 ngpus, generate use 0.5 ngpus
-
-# Offpolicy steps
-trainer.generate_ahead_steps=3
-
-# Performance Tuning
+ 
+# Performance Tuning, enable async-param-update
 +actor_rollout_ref.rollout.enable_dual_buffer=True \
-+actor_rollout_ref.rollout.param_update_preduce_bucket_size_mb=256 \
+# The sender granularity of the actor training node during parameter update
++actor_rollout_ref.rollout.param_update_preduce_bucket_size_mb=512 \
+# The receiver granularity of the rollout inference node is too large, which will cause GPU-OOM
 +actor_rollout_ref.rollout.param_update_consume_bucket_size_mb=128 \
-
+ 
+# The granularity of offpolicy, 2 means that generate is faster than the train node to execute 2 steps, that is, one-step-offpolicy
++trainer.generate_ahead_steps=2 \
 ```
 
 ## Usage
