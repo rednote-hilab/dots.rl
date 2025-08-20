@@ -148,17 +148,21 @@ Loading   Generation   Rollout   Log Probs   Rewards   Model    Params
 
 ```python
 # Async RL Configuration
-use_async_rl: bool = True
-enable_param_sync: bool = True
-enable_async_mode: bool = True
+trainer.async_pipeline=True
 
 # Resource Management
 share_resource_between_train_logp_ref_logp: bool = True
-generate_ahead_steps: int = 3
+trainer.use_nodes_ratios=[0.5,0.5,0.5,0.5]
+# means: train/logp/ref_logp use 0.5 ngpus, generate use 0.5 ngpus
+
+# Offpolicy steps
+trainer.generate_ahead_steps=3
 
 # Performance Tuning
-dataloader_prefetch_steps: int = 10
-param_update_preduce_bucket_size_mb: int = 512
++actor_rollout_ref.rollout.enable_dual_buffer=True \
++actor_rollout_ref.rollout.param_update_preduce_bucket_size_mb=256 \
++actor_rollout_ref.rollout.param_update_consume_bucket_size_mb=128 \
+
 ```
 
 ## Usage
@@ -172,8 +176,6 @@ from verl.trainer.ppo.pipeline import AsyncTrainingFlow
 flow = AsyncTrainingFlow(
     trainer=trainer,
     enable_async_rl=True,
-    enable_param_sync=True,
-    enable_async_mode=True
 )
 
 # Run the async training
@@ -184,6 +186,7 @@ await flow.run()
 
 ```python
 # Custom state machine creation
+# Inherit the state machine base class and implement your own state machine and insert it to async pipeline flow(AsyncTrainingFlow)
 from verl.trainer.ppo.pipeline import create_role_state_machine
 
 state_machine = create_role_state_machine(
@@ -233,12 +236,6 @@ The system implements sophisticated resource management through:
 - **Pipeline Resilience**: System continues operation even if individual components fail
 - **Graceful Degradation**: Falls back to synchronous mode if needed
 
-### Monitoring and Debugging
-
-- **Timing Statistics**: Comprehensive timing collection for performance analysis
-- **State Tracking**: Real-time state machine status monitoring
-- **Performance Metrics**: Detailed performance and utilization metrics
-
 ## Contributing
 
 When contributing to the async-RL pipeline:
@@ -248,12 +245,6 @@ When contributing to the async-RL pipeline:
 3. **Performance**: Consider the impact on overall pipeline performance
 4. **Testing**: Test both synchronous and asynchronous modes
 5. **Documentation**: Update this README for any new features
-
-## References
-
-- **Paper**: [Async-RL: Asynchronous Reinforcement Learning for Large-Scale Training]
-- **Implementation**: Based on VERL framework
-- **Performance**: Benchmarked on Red-MoE-16B model
 
 ---
 

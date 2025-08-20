@@ -1061,7 +1061,7 @@ class GenerateStateMachine(BaseRoleStateMachine):
         
         # Check the distance between generate and param_update. 
         # If it is too far, Blocking to waiting param_update.
-        while step >= self.last_param_update_step + self.generate_ahead_steps:
+        while step > self.last_param_update_step + self.generate_ahead_steps:
             enhanced_print("generate", None, f"Step {step} is too far ahead of param_update {self.last_param_update_step}, waiting for next param_update...")
             param_update_signal = await self.pipeline.pull("param_update", "generate")
             
