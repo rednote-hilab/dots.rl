@@ -670,6 +670,8 @@ class SGLangRollout(BaseRollout):
         if enable_dual_buffer and is_dual_buffer:
             self._wait_for_param_update_completion()
             self.update_weight_from_dual_buffer()
+        if enable_dual_buffer:
+            dist.barrier()
 
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
@@ -842,10 +844,18 @@ class SGLangRollout(BaseRollout):
         )
         out = _post_process_outputs(self.processing_class, output)
 
-        response = out[0].to(idx.device)
+        use_gpu_tensor = False
+        if not use_gpu_tensor:
+            idx = idx.to("cpu", non_blocking=True)
+            attention_mask = attention_mask.to("cpu", non_blocking=True)
+            position_ids = position_ids.to("cpu", non_blocking=True)
+
+        target_device = idx.device if use_gpu_tensor else torch.device("cpu")
+
+        response = out[0].to(target_device)
         rollout_log_probs = None
         if self.config.calculate_log_probs:
-            rollout_log_probs = out[1].to(idx.device)
+            rollout_log_probs = out[1].to(target_device)
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)

@@ -597,9 +597,7 @@ def get_hf_model_checkpoint_path(checkpoint_path):
 
 def get_transformer_config_checkpoint_path(checkpoint_path):
     os.makedirs(checkpoint_path, exist_ok=True)
-    # TODO: use a more standard name?
-    # return os.path.join(checkpoint_path, "transformer_config.json")
-    return os.path.join(checkpoint_path, "hf_config_and_tokenizer")
+    return os.path.join(checkpoint_path, "transformer_config.json")
 
 
 def get_optimizer_checkpoint_path(checkpoint_path, use_distributed_optimizer=True):
@@ -1350,7 +1348,7 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
                 offset = vp_stage * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
+                if hasattr(config, 'account_for_embedding_in_pipeline_split') and config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
                     **extra_kwargs
                 ):
                     offset -= 1
@@ -1358,7 +1356,7 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
                 offset = pipeline_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
+                if hasattr(config, 'account_for_embedding_in_pipeline_split') and config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
                     **extra_kwargs
                 ):
                     offset -= 1

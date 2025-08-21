@@ -170,47 +170,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def __init__(self, config: DictConfig, role: str, **kwargs):
         Worker.__init__(self)
         self.config = config
-        if repatch is not None:
-            # NPU MindSpeed patch, will be refactored with MindSpeedEngine.
-            repatch(self.config.actor.megatron.get("override_transformer_config", {}))
-
-        # NOTE(sgm): We utilize colocate WorkerGroup by default.
-        # As a result, Workers for different model share the same process.
-        # Therefore, we only require one distribute initialization.
-        # To utilize different parallel strategy in different models:
-        # 1, users should disable WorkerDict; 2.assign different ResourcePool to different models,
-        # 3. and apply the following patch in ray==2.10, https://github.com/ray-project/ray/pull/44385
-        if not torch.distributed.is_initialized():
-            rank = int(os.environ["LOCAL_RANK"])
-            torch.distributed.init_process_group(
-                backend=get_nccl_backend(),
-                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
-                init_method=os.environ.get("DIST_INIT_METHOD", None),
-            )
-            get_torch_device().set_device(rank)
-
-            mpu.initialize_model_parallel(
-                tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
-                pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
-                virtual_pipeline_model_parallel_size=self.config.actor.megatron.virtual_pipeline_model_parallel_size,
-                pipeline_model_parallel_split_rank=None,
-                use_sharp=False,
-                context_parallel_size=self.config.actor.megatron.context_parallel_size,
-                expert_model_parallel_size=self.config.actor.megatron.expert_model_parallel_size,
-                expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
-                nccl_communicator_config_path=None,
-            )
-
-        is_collect = (
-            mpu.get_tensor_model_parallel_rank() == 0
-            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-            and mpu.get_context_parallel_rank() == 0
-        )
-        self._register_dispatch_collect_info(
-            mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
-        )
-
-        set_random_seed(seed=self.config.actor.megatron.seed)
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -218,38 +177,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
-
-        if self._is_actor:
-            omega_profiler_config = config.actor.get("profiler", {})
-        elif self._is_rollout:
-            # NOTE: In colocation mode, rollout config may not take effect (follow the actor config)
-            # This is for extendability in AsyncRL cases
-            omega_profiler_config = config.rollout.get("profiler", {})
-        elif self._is_ref:
-            omega_profiler_config = config.ref.get("profiler", {})
-        else:
-            raise ValueError(
-                f"Invalid role {self.role}, should be one of "
-                "['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']"
-            )
-        # omega_profiler_config is DictConfig
-        # profiler_config is a ProfilerConfig dataclass
-        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch"]:
-            tool_config = omega_conf_to_dataclass(
-                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
-            )
-        else:
-            tool_config = None
-        DistProfilerExtension.__init__(
-            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
-        )
-
-        # TODO(sgm): Currently, we only support reference model param offload
-        # will support other offload later
-        self._is_offload_param = False
-        self._is_offload_grad = False
-        self._is_offload_optimizer = False
 
         def enable_megatron_sequence_parallel():
             if self._is_actor and self.config.actor.megatron.sequence_parallel:
@@ -308,23 +235,25 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 return self.config.ref.megatron.seed
             return 42
 
-        self._is_sperated_arch = not (self._is_actor and self._is_rollout)
+        if repatch is not None:
+            # NPU MindSpeed patch, will be refactored with MindSpeedEngine.
+            repatch(self.config.actor.megatron.get("override_transformer_config", {}))
 
         # NOTE(sgm): We utilize colocate WorkerGroup by default.
         # As a result, Workers for different model share the same process.
         # Therefore, we only require one distribute initialization.
-        # To utilize different parallel startegy in different models:
+        # To utilize different parallel strategy in different models:
         # 1, users should disable WorkerDict; 2.assign different ResourcePool to different models,
         # 3. and apply the following patch in ray==2.10, https://github.com/ray-project/ray/pull/44385
         if not torch.distributed.is_initialized():
             rank = int(os.environ["LOCAL_RANK"])
-            from datetime import timedelta
-            torch.distributed.init_process_group(backend="nccl", timeout=timedelta(seconds=3600))
+            torch.distributed.init_process_group(
+                backend=get_nccl_backend(),
+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+            )
+            get_torch_device().set_device(rank)
 
-            torch.cuda.set_device(rank)
-
-            if enable_megatron_sequence_parallel():
-                os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
             mpu.initialize_model_parallel(
                 tensor_model_parallel_size=tp(),
                 pipeline_model_parallel_size=pp(),
@@ -337,7 +266,50 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 nccl_communicator_config_path=None,
             )
 
+        is_collect = (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+            and mpu.get_context_parallel_rank() == 0
+        )
+        self._register_dispatch_collect_info(
+            mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
+        )
+
         set_random_seed(seed=seed())
+
+        if self._is_actor:
+            omega_profiler_config = config.actor.get("profiler", {})
+        elif self._is_rollout:
+            # NOTE: In colocation mode, rollout config may not take effect (follow the actor config)
+            # This is for extendability in AsyncRL cases
+            omega_profiler_config = config.rollout.get("profiler", {})
+        elif self._is_ref:
+            omega_profiler_config = config.ref.get("profiler", {})
+        else:
+            raise ValueError(
+                f"Invalid role {self.role}, should be one of "
+                "['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']"
+            )
+        # omega_profiler_config is DictConfig
+        # profiler_config is a ProfilerConfig dataclass
+        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch"]:
+            tool_config = omega_conf_to_dataclass(
+                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+            )
+        else:
+            tool_config = None
+        DistProfilerExtension.__init__(
+            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+        )
+
+        # TODO(sgm): Currently, we only support reference model param offload
+        # will support other offload later
+        self._is_offload_param = False
+        self._is_offload_grad = False
+        self._is_offload_optimizer = False
+
+        self._is_sperated_arch = not (self._is_actor and self._is_rollout)
 
         # normalize config
         if (self._is_actor and self._is_rollout) or (self._is_actor and self._is_sperated_arch):
@@ -424,7 +396,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             parallel_model.cuda()
             return parallel_model
  
-        if self._is_actor or self._is_rollout:
+        print(f"is actor:{self._is_actor}, is rollout: {self._is_rollout}, is ref: {self._is_ref}")
+        # if self._is_actor or self._is_rollout:
+        if self._is_actor or (not self._is_sperated_arch and (self._is_actor or self._is_rollout)):
             wrap_config = McoreModuleWrapperConfig(
                 is_value_model=False,  # actor is not value model
                 share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
@@ -915,7 +889,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if hasattr(self.param_update_manager, "wait_for_send_complete"):
             self.param_update_manager.wait_for_send_complete()
 
-    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
+    @register(dispatch_mode=Dispatch.ALL_TO_ONE, execute_mode=Execute.ALL)
     @GPUMemoryLogger(role="get_params_meta", logger=logger)
     def get_params_meta(self):
         """
@@ -995,7 +969,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         prompts.meta_info.update(meta_info)
 
         with self.sharding_manager:
-            log_gpu_memory_usage("After entering sharding manager", logger=logger)
 
             # (zhangchi.usc1992) wake up kv cache here. Currently only support vllm.
             # Will support sglang once separate wakeup of model weights and kv cache is supported

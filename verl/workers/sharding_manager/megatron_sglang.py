@@ -364,6 +364,7 @@ class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
                     await self.inference_engine.update_weights_from_reqinput(obj)
                 if self.device_mesh["tp"].get_local_rank() == 0:
                     await self.inference_engine.flush_cache()
+            # del params
         else:
             # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
             # named_tensors = [(k, v) for k, v in params.items()]

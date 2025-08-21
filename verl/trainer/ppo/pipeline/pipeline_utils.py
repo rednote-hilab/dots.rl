@@ -47,6 +47,7 @@ ROLE_COLORS = {
     "logp": Fore.MAGENTA,
     "ref_logp": Fore.CYAN,
     "param_update": Fore.RED,
+    "validation": Fore.YELLOW,
 }
 
 def enhanced_print(src_role, dst_role, message):
@@ -106,6 +107,7 @@ class AsyncPipeline:
             "reward",
             "logp",
             "ref_logp",
+            "validation",
         }
         
         enhanced_print("pipeline", None, f"AsyncPipeline initialized: max_queue_size={max_queue_size}, transfer_mode={transfer_mode.value}")
@@ -418,10 +420,10 @@ class AsyncPipeline:
             total_time = time.time() - start_time
             
             # Record performance analysis
-            if total_time > 0.1:
+            if debug_log and total_time > 0.1:
                 enhanced_print(dst_role, src_role, f"DIRECT OBJECT STORE GET: {use_queue_name} ray_get={ray_get_time:.3f}s, total={total_time:.3f}s, remaining_refs={len(self._object_store_pairs[use_queue_name])}")
             
-            if total_time > 1.0:
+            if debug_log and total_time > 1.0:
                 enhanced_print(dst_role, src_role, f"⚠️ SLOW DIRECT GET: {use_queue_name} took {total_time:.2f}s (ray_get: {ray_get_time:.2f}s)")
         else:
             # Use Ray queue
@@ -449,10 +451,10 @@ class AsyncPipeline:
                 total_time = time.time() - start_time
                 
                 # Record performance analysis
-                if total_time > 0.1:
+                if debug_log and total_time > 0.1:
                     enhanced_print(dst_role, src_role, f"RAY_GET OPTIMIZATION: {use_queue_name} queue_get={queue_get_time:.3f}s, ray_get={ray_get_time:.3f}s, total={total_time:.3f}s")
                 
-                if total_time > 1.0:
+                if debug_log and total_time > 1.0:
                     enhanced_print(dst_role, src_role, f"⚠️ SLOW RAY_GET: {use_queue_name} took {total_time:.2f}s (queue_get: {queue_get_time:.2f}s, ray_get: {ray_get_time:.2f}s)")
             elif self.transfer_mode == TransferMode.RAY_QUEUE_COMPRESSED:
                 # Original method: decompression processing
@@ -476,11 +478,11 @@ class AsyncPipeline:
                 total_time = time.time() - start_time
                 
                 # Detailed analysis of get_async performance
-                if get_time > 0.1:  # Record if over 100ms
+                if debug_log and get_time > 0.1:  # Record if over 100ms
                     enhanced_print(dst_role, src_role, f"GET_ASYNC ANALYSIS: {use_queue_name} get_async={get_time:.3f}s, decompress={decompress_time:.3f}s, total={total_time:.3f}s")
                 
                 # Print warning if total time exceeds 1 second
-                if total_time > 1.0:
+                if debug_log and total_time > 1.0:
                     enhanced_print(dst_role, src_role, f"⚠️ SLOW PULL: {use_queue_name} took {total_time:.2f}s (get_async: {get_time:.2f}s, decompress: {decompress_time:.2f}s)")
             else: # RAY_QUEUE mode
                 # Original method: decompression processing
@@ -504,11 +506,11 @@ class AsyncPipeline:
                 total_time = time.time() - start_time
                 
                 # Detailed analysis of get_async performance
-                if get_time > 0.1:  # Record if over 100ms
+                if debug_log and get_time > 0.1:  # Record if over 100ms
                     enhanced_print(dst_role, src_role, f"GET_ASYNC ANALYSIS: {use_queue_name} get_async={get_time:.3f}s, decompress={decompress_time:.3f}s, total={total_time:.3f}s")
                 
                 # Print warning if total time exceeds 1 second
-                if total_time > 1.0:
+                if debug_log and total_time > 1.0:
                     enhanced_print(dst_role, src_role, f"⚠️ SLOW PULL: {use_queue_name} took {total_time:.2f}s (get_async: {get_time:.2f}s, decompress: {decompress_time:.2f}s)")
         
         return result
