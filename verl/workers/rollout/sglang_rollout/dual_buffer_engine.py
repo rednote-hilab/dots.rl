@@ -30,6 +30,7 @@ from sglang.srt.managers.tokenizer_manager import (
 )
 
 from verl.trainer.ppo.pipeline.pipeline_utils import enhanced_print
+from verl.utils.profiler import log_gpu_memory_usage
 
 
 class _BufferManager:
@@ -407,7 +408,6 @@ class DualBufferAsyncEngine:
         
         def _run_async_in_sync_context(self, coro):
             """Wrapper function to run async coroutine in sync context"""
-            import asyncio
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
@@ -419,7 +419,7 @@ class DualBufferAsyncEngine:
                 else:
                     # If event loop is not running, use directly
                     result = loop.run_until_complete(coro)
-            except RuntimeError:
+            except RuntimeError as ex:
                 # If no event loop, create new
                 new_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(new_loop)
@@ -432,12 +432,16 @@ class DualBufferAsyncEngine:
             try:                
                 # Directly call AsyncEngine's update_weights_from_tensor method
                 # Use sync wrapper to handle async call
+                t1 = time.time()
                 result = self._run_async_in_sync_context(
                     update_weights_func_call(
                         weights,
                         use_reqinput=self._bufman._use_reqinput
                     )
                 )
+                t2 = time.time()
+                print(f"[DualBufferAsyncEngine] Applied weights to engine in {t2-t1:.2f} seconds")
+
                 return result
             except Exception as e:
                 print(f"[DualBufferAsyncEngine] ERROR: Failed to apply weights to AsyncEngine: {e}")
@@ -509,7 +513,7 @@ class DualBufferAsyncEngine:
                 # if buffer_id == self._active_buffer:
                 #     # Already in use, no need to switch again
                 #     return True
-                
+
                 # Apply weights of new buffer to engine (only switch active_buffer and current_version after successful application)
                 t1 = time.time()
                 buffer = self._get_buffer(buffer_id)
@@ -519,12 +523,15 @@ class DualBufferAsyncEngine:
 
                 payload = self._bufman.build_payload_for_apply(buffer_id)
                 t2 = time.time()
-                
+
                 if payload is None:
                     enhanced_print("DualBufferAsyncEngine", None, f"Build payload failed for buffer {buffer_id}")
                     return False
 
                 success = self._apply_weights_to_engine_sync(payload, update_weights_func_call)
+
+                # del payload
+                torch.cuda.empty_cache()  # Clear cache after applying weights
                 
                 t3 = time.time()
                 # Build payload for buffer 0 took 35.02 s, apply weights took 12.09 s

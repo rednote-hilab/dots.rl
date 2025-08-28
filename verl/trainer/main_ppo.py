@@ -181,35 +181,45 @@ class TaskRunner:
             actor_pool_id = "actor_pool"
             ref_pool_id = "ref_pool"
             rollout_pool_id = "rollout_pool"
-            # 2x8 
-            # 0.25 0.25 0.5 -> 4+4+8
-            # [4], [4], [8]
-            # trainer.use_nodes_ratios=[0.5,0.5,0.5,0.5] 
-            # means: train/logp/ref_logp use 0.5 ngpus, generate use 0.5 ngpus
-            total_use_nodes_ratio = config.trainer.use_nodes_ratios
+            # Calculate pool sizes based on task groups and node ratios
+            # sperated_node_ratios: node ratios for each task group
+            # sperated_node_tasks: task separation configuration
+            # Example: 
+            # sperated_node_tasks = [[logp, actor-train], ref_logp, generate]
+            # sperated_node_ratios = [0.5, 0.25, 0.25]
+            # means: first group (logp+actor-train) uses 50% nodes, ref_logp uses 25%, generate uses 25%
+            sperated_node_ratios = config.trainer.sperated_node_ratios
+            sperated_node_tasks = config.trainer.sperated_node_tasks
             total_ngpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-            actor_use_nodes_ratio, logp_use_nodes_ratio, ref_use_nodes_ratio, rollout_use_nodes_ratio = total_use_nodes_ratio
-            actor_pool_size = int(actor_use_nodes_ratio * total_ngpus)
-            ref_pool_size = int(ref_use_nodes_ratio * total_ngpus)
-            rollout_pool_size = int(rollout_use_nodes_ratio * total_ngpus)
+            
+            # Use utility function to calculate pool sizes
+            from verl.trainer.ppo.pipeline.utils import calculate_pool_sizes_from_task_groups, is_ref_model_separated
+            pool_sizes = calculate_pool_sizes_from_task_groups(sperated_node_tasks, sperated_node_ratios, total_ngpus)
+            
+            # Extract pool sizes for each task
+            actor_pool_size = pool_sizes.get('actor-train', pool_sizes.get('actor', 0))
+            ref_pool_size = pool_sizes.get('ref_logp', pool_sizes.get('ref', 0))
+            rollout_pool_size = pool_sizes.get('generate', pool_sizes.get('rollout', 0))
             def gen_pool_spec(pool_size):
                 """Generate a pool spec for the given pool size."""
+                if pool_size <= 0:
+                    raise ValueError(f"Pool size must be positive, got {pool_size}")
                 nper_node = config.trainer.n_gpus_per_node
                 pool_nodes = pool_size // nper_node
                 if pool_nodes > 0 and pool_size != nper_node * pool_nodes:
                     raise ValueError(f"Pool size {pool_size} must be a multiple of n_gpus_per_node {nper_node}. \
                         or this setting will get poor performance.")
                 return [config.trainer.n_gpus_per_node] * pool_nodes if pool_nodes > 1 else [pool_size]
-        
-            # TODO: check hybrid actor/ref
-            hybrid_actor_ref = actor_pool_size == ref_pool_size
+
+            # Use utility function to determine if ref model is separated
+            sperated_ref_model = is_ref_model_separated(sperated_node_tasks)
             
             resource_pool_spec = {
                 # TODO: node size;
                 actor_pool_id: gen_pool_spec(actor_pool_size),
                 rollout_pool_id: gen_pool_spec(rollout_pool_size),
             }
-            if hybrid_actor_ref:
+            if not sperated_ref_model:
                 ref_pool_id = actor_pool_id
             else:
                 resource_pool_spec[ref_pool_id] = gen_pool_spec(ref_pool_size)

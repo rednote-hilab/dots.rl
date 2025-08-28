@@ -241,7 +241,7 @@ class AsyncTrainingFlow:
                 role_name, self.pipeline, self.trainer, 
                 use_async_rl=self.use_async_rl
             )
-            for role_name in ["dataloader", "rollout", "train", "generate", "reward", "logp", "ref_logp", "param_update"]
+            for role_name in ["dataloader", "rollout", "train", "generate", "reward", "logp", "ref_logp", "param_update", "validation"]
         }
     
     async def run_state_machine_pipeline(self):

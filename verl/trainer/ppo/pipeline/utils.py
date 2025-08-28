@@ -19,6 +19,8 @@ class ResourceLock:
         self._current_owner = None
         self._waiting_queue = []
         self._train_completed_steps = set()  # Record completed train steps
+        self._last_wait_log_time = {}  # Track last wait log time for each owner
+        self._wait_log_interval = 10  # Log wait message every 10 seconds
     
     async def acquire(self, owner_name: str, step: int = None) -> bool:
         """Get resource lock"""
@@ -32,14 +34,22 @@ class ResourceLock:
         async with self._lock:
             # Wait for resource available
             while self._current_owner is not None and self._current_owner != owner_name:
-                from .pipeline_utils import enhanced_print
-                enhanced_print("ResourceLock", None, f"{owner_name} waiting for resource, current owner: {self._current_owner}")
+                current_time = time.time()
+                # Only log wait message every few seconds to reduce spam
+                if (owner_name not in self._last_wait_log_time or 
+                    current_time - self._last_wait_log_time[owner_name] >= self._wait_log_interval):
+                    from .pipeline_utils import enhanced_print
+                    enhanced_print("ResourceLock", None, f"{owner_name} waiting for resource, current owner: {self._current_owner}")
+                    self._last_wait_log_time[owner_name] = current_time
                 await asyncio.sleep(1)
             
             # Get resource
             self._current_owner = owner_name
             if owner_name in self._waiting_queue:
                 self._waiting_queue.remove(owner_name)
+            # Clear wait log time when acquired
+            if owner_name in self._last_wait_log_time:
+                del self._last_wait_log_time[owner_name]
             from .pipeline_utils import enhanced_print
             enhanced_print("ResourceLock", None, f"{owner_name} acquired resource lock")
             return True
@@ -53,7 +63,7 @@ class ResourceLock:
             if owner_name == "train" and step is not None:
                 self._train_completed_steps.add(step)
                 from .pipeline_utils import enhanced_print
-                enhanced_print("ResourceLock", None, f"Train step {step} completed, available steps: {sorted(self._train_completed_steps)}")
+                enhanced_print("ResourceLock", None, f"Train step {step} completed")
             
             from .pipeline_utils import enhanced_print
             enhanced_print("ResourceLock", None, f"{owner_name} released resource lock")
@@ -176,6 +186,106 @@ def timing_decorator(role_name: str):
     return decorator
 
 
+def is_ref_model_separated(sperated_node_tasks):
+    """
+    Determine if ref model is separated based on sperated_node_tasks configuration.
+    
+    Args:
+        sperated_node_tasks: omegaconf.listconfig.ListConfig or list, task separation configuration
+    
+    Returns:
+        bool: True if ref model is separated, False otherwise
+    """
+    # Enhanced check for separated ref model based on sperated_node_tasks configuration
+    # sperated_node_tasks is omegaconf.listconfig.ListConfig type
+    
+    # Check if ref_logp is in a separate task group
+    if hasattr(sperated_node_tasks, '__iter__'):
+        # Handle ListConfig type
+        sperated_task_list = list(sperated_node_tasks)
+        if len(sperated_task_list) > 0:
+            if isinstance(sperated_task_list[0], list):
+                # Nested list case: [[logp, actor-train], ref_logp, generate]
+                if 'ref_logp' in sperated_task_list[0]:
+                    # ref_logp is in the first group with actor-train, not separated
+                    return False
+                else:
+                    # Check if ref_logp is in any other group
+                    for task_group in sperated_task_list:
+                        if isinstance(task_group, list) and 'ref_logp' in task_group:
+                            # ref_logp is in a group with other tasks, not separated
+                            return False
+                    # ref_logp is not in any group, it's separated
+                    return True
+            else:
+                # Flat list case: [logp, ref_logp, actor-train, generate]
+                if 'ref_logp' in sperated_task_list:
+                    # ref_logp is explicitly listed, it's separated
+                    return True
+                else:
+                    # ref_logp is not explicitly listed, not separated
+                    return False
+        else:
+            # Empty list case, not separated
+            return False
+    else:
+        # Fallback for non-iterable types, not separated
+        return False
+
+
+def calculate_pool_sizes_from_task_groups(sperated_node_tasks, sperated_node_ratios, total_ngpus):
+    """
+    Calculate pool sizes based on task groups and node ratios.
+    
+    Args:
+        sperated_node_tasks: omegaconf.listconfig.ListConfig or list, task separation configuration
+        sperated_node_ratios: list, node ratios for each task group
+        total_ngpus: int, total number of GPUs
+    
+    Returns:
+        dict: pool sizes for each task group
+    """
+    if not hasattr(sperated_node_tasks, '__iter__'):
+        # Fallback: use original logic
+        return {
+            'logp': int(sperated_node_ratios[0] * total_ngpus),
+            'actor-train': int(sperated_node_ratios[1] * total_ngpus),
+            'ref_logp': int(sperated_node_ratios[2] * total_ngpus),
+            'generate': int(sperated_node_ratios[3] * total_ngpus)
+        }
+    
+    sperated_task_list = list(sperated_node_tasks)
+    
+    # Assert that the number of task groups matches the number of node ratios
+    assert len(sperated_task_list) == len(sperated_node_ratios), \
+        f"Number of task groups ({len(sperated_task_list)}) must match number of node ratios ({len(sperated_node_ratios)})"
+    
+    pool_sizes = {}
+    
+    # Calculate pool sizes based on task groups
+    for i, task_group in enumerate(sperated_task_list):
+        ratio = sperated_node_ratios[i]
+        pool_size = int(ratio * total_ngpus)
+        
+        # Ensure pool_size is at least 1
+        if pool_size <= 0:
+            pool_size = 1
+            print(f"Warning: Pool size for task group {task_group} was {int(ratio * total_ngpus)}, setting to minimum value 1")
+        
+        # Check if task_group is iterable (list, ListConfig, etc.)
+        if hasattr(task_group, '__iter__') and not isinstance(task_group, str):
+            # Nested list case: assign pool size to each task in the group
+            for task in task_group:
+                pool_sizes[task] = pool_size
+        else:
+            # Single task case
+            pool_sizes[task_group] = pool_size
+    
+    return pool_sizes
+
+
 # Global instance
-resource_lock = ResourceLock()
+resource_lock = ResourceLock()  # For train/logp/ref_logp/param_update
+engine_resource_lock = ResourceLock()  # For generate/validation
+dataloader_scheduler_lock = ResourceLock()  # For dataloader scheduling (train vs validation)
 global_timing_collector = TimingStatsCollector() 
