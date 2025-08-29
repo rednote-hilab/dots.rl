@@ -151,8 +151,47 @@ Loading   Generation   Rollout   Log Probs   Rewards   Model    Params
 +actor_rollout_ref.async_pipeline=True \
  
 # Resource Management
-+trainer.use_nodes_ratios=[0.5,0.5,0.5,0.5] \
++trainer.sperated_node_ratios=[0.5,0.5] \
+# means: each task group uses 0.5 of total nodes
 # means: train/logp/ref_logp use 0.5 ngpus, generate use 0.5 ngpus
+
+## Task Group Configuration Examples
+
+### Example 1: Complete Separation
+```bash
++trainer.sperated_node_tasks=[logp,ref_logp,actor-train,generate] \
++trainer.sperated_node_ratios=[0.25,0.25,0.25,0.25] \
+```
+**Explanation**: Each task gets 25% of total nodes
+- `logp`: 25% nodes
+- `ref_logp`: 25% nodes  
+- `actor-train`: 25% nodes
+- `generate`: 25% nodes
+
+### Example 2: Hybrid Mode (logp + actor-train grouped)
+```bash
++trainer.sperated_node_tasks=[[logp,actor-train],ref_logp,generate] \
++trainer.sperated_node_ratios=[0.5,0.25,0.25] \
+```
+**Explanation**: 
+- First group `[logp,actor-train]`: 50% nodes (shared)
+- `ref_logp`: 25% nodes
+- `generate`: 25% nodes
+
+### Example 3: Hybrid Mode (logp + actor-train + ref_logp grouped)
+```bash
++trainer.sperated_node_tasks=[[logp,actor-train,ref_logp],generate] \
++trainer.sperated_node_ratios=[0.5,0.5] \
+```
+**Explanation**:
+- First group `[logp,actor-train,ref_logp]`: 50% nodes (shared)
+- `generate`: 50% nodes
+
+### Configuration Rules
+1. **Length Match**: `sperated_node_tasks` and `sperated_node_ratios` must have the same length
+2. **Ratio Sum**: Node ratios should sum to 1.0 (or less for resource reservation)
+3. **Task Grouping**: Tasks in the same list share the same node resources
+4. **Resource Allocation**: Each task group gets the specified ratio of total nodes
  
 # Performance Tuning, enable async-param-update
 +actor_rollout_ref.rollout.enable_dual_buffer=True \
@@ -161,7 +200,10 @@ Loading   Generation   Rollout   Log Probs   Rewards   Model    Params
 # The receiver granularity of the rollout inference node is too large, which will cause GPU-OOM
 +actor_rollout_ref.rollout.param_update_consume_bucket_size_mb=128 \
  
-# The granularity of offpolicy, 2 means that generate is faster than the train node to execute 2 steps, that is, one-step-offpolicy
+# Async LogP/RefLogP computation
+# Uses ray.remote for non-blocking logp and ref_logp computation
+ 
+# The granularity of offpolicy, 1 means that generate is faster than the train node to execute 1 steps, that is, one-step-offpolicy
 +trainer.generate_ahead_steps=2 \
 ```
 

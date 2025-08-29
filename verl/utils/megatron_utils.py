@@ -626,6 +626,30 @@ def get_rng_states_checkpoint_path(checkpoint_path, only_rank0_save=True):
     return os.path.join(checkpoint_path, "rng_states", f"rng_states_pp{pp_rank}_tp{tp_rank}_cp{cp_rank}_dp{dp_rank}.pt")
 
 
+def get_optimizer_checkpoint_path(checkpoint_path, use_distributed_optimizer=True):
+    os.makedirs(os.path.join(checkpoint_path, "optim"), exist_ok=True)
+    if not use_distributed_optimizer:
+        return os.path.join(checkpoint_path, "optim", "optim.pt")
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    # cp_rank = mpu.get_context_parallel_rank()
+    # dp_rank = mpu.get_data_parallel_rank()
+    ep_rank = mpu.get_expert_model_parallel_rank()
+    return os.path.join(checkpoint_path, "optim", f"distrib_optim_pp{pp_rank}_tp{tp_rank}_ep{ep_rank}.pt")
+
+
+def get_rng_states_checkpoint_path(checkpoint_path, only_rank0_save=True):
+    # save rng states cause interrupts
+    os.makedirs(os.path.join(checkpoint_path, "rng_states"), exist_ok=True)
+    if only_rank0_save:
+        return os.path.join(checkpoint_path, "rng_states", "rng_states.pt")
+    dp_rank = mpu.get_data_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    cp_rank = mpu.get_context_parallel_rank()
+    return os.path.join(checkpoint_path, "rng_states", f"rng_states_pp{pp_rank}_tp{tp_rank}_cp{cp_rank}_dp{dp_rank}.pt")
+
+
 def convert_megatron_model_to_transformers_model(
     name,
     param,
@@ -1350,7 +1374,7 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
                 offset = vp_stage * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
+                if hasattr(config, 'account_for_embedding_in_pipeline_split') and config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
                     **extra_kwargs
                 ):
                     offset -= 1
@@ -1358,7 +1382,7 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
                 offset = pipeline_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
+                if hasattr(config, 'account_for_embedding_in_pipeline_split') and config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
                     **extra_kwargs
                 ):
                     offset -= 1

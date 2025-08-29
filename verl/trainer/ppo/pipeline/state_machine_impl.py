@@ -23,7 +23,7 @@ from pprint import pprint
 
 from .pipeline_utils import AsyncPipeline, enhanced_print, PIPELINE_END_SIGNAL, PIPELINE_START_SINGLE, TransferMode
 from .state_machine import BaseRoleStateMachine, RoleState, RoleEvent
-from .utils import resource_lock, global_timing_collector, timing_decorator
+from .utils import resource_lock, engine_resource_lock, dataloader_scheduler_lock, global_timing_collector, timing_decorator
 
 import ray
 from ray.util.queue import Queue
@@ -52,6 +52,30 @@ from verl.trainer.ppo.ray_trainer import (
     DataProto,
     apply_kl_penalty,
 )
+
+
+
+# Ray remote functions for async computation
+@ray.remote(num_cpus=1)
+def compute_logp_async(actor_wg, batch: DataProto):
+    """Async logp computation using ray.remote"""
+    # Note: Resource lock is handled in the calling state machine
+    return actor_wg.compute_log_prob(batch)
+
+@ray.remote(num_cpus=1)
+def compute_ref_logp_async(ref_policy_wg, actor_wg, batch: DataProto, ref_in_actor: bool):
+    """Async ref_logp computation using ray.remote"""
+    # Note: Resource lock is handled in the calling state machine
+    if not ref_in_actor:
+        return ref_policy_wg.compute_ref_log_prob(batch)
+    else:
+        return actor_wg.compute_ref_log_prob(batch)
+
+@ray.remote(num_cpus=1)
+def compute_reward_async(batch: DataProto, reward_fn):
+    """Async reward computation using ray.remote"""
+    # Note: Resource lock is handled in the calling state machine
+    return compute_reward(batch, reward_fn)
 
 
 class DataloaderStateMachine(BaseRoleStateMachine):
@@ -105,21 +129,30 @@ class DataloaderStateMachine(BaseRoleStateMachine):
     async def process_data(self, data: Any) -> Any:
         """Process data loading logic - block execution to ensure correctness"""
         if data == "START":
-            # Block getting next batch
-            batch_result = next(self.batch_iter)
+            # Acquire dataloader scheduler lock before loading data
+            await dataloader_scheduler_lock.acquire("train_dataloader")
+            enhanced_print("dataloader", None, "Acquired dataloader scheduler lock for training data")
             
-            cur_global_steps, gen_batch, batch_dict = batch_result
-            if gen_batch == PIPELINE_END_SIGNAL:
-                enhanced_print("dataloader", None, "dataloader loop finished.")
-                return "END"
-            
-            # Validate batch_dict data
-            if not batch_dict or not isinstance(batch_dict, dict):
-                enhanced_print("dataloader", None, f"Invalid batch_dict from trainer: {batch_dict}")
-                return None
-            
-            enhanced_print("dataloader", None, f"Returning batch for step {cur_global_steps}")
-            return (cur_global_steps, gen_batch, batch_dict)
+            try:
+                # Block getting next batch
+                batch_result = next(self.batch_iter)
+                
+                cur_global_steps, gen_batch, batch_dict = batch_result
+                if gen_batch == PIPELINE_END_SIGNAL:
+                    enhanced_print("dataloader", None, "dataloader loop finished.")
+                    return "END"
+                
+                # Validate batch_dict data
+                if not batch_dict or not isinstance(batch_dict, dict):
+                    enhanced_print("dataloader", None, f"Invalid batch_dict from trainer: {batch_dict}")
+                    return None
+                
+                enhanced_print("dataloader", None, f"Returning batch for step {cur_global_steps}")
+                return (cur_global_steps, gen_batch, batch_dict)
+            finally:
+                # Release dataloader scheduler lock after loading data
+                await dataloader_scheduler_lock.release("train_dataloader")
+                enhanced_print("dataloader", None, "Released dataloader scheduler lock for training data")
         else:
             enhanced_print("dataloader", None, f"Unexpected data received: {data}, returning None")
             return None
@@ -163,9 +196,6 @@ class RolloutStateMachine(BaseRoleStateMachine):
         self._total_engines = rollout_wg.world_size
         tp_size = trainer.config.actor_rollout_ref.rollout.tensor_model_parallel_size
         self._tp_rank_0_engines = self._total_engines // tp_size
-        
-        # Check if resources are shared, TODO: support separated train vs logp/ref_logp
-        self._share_resources = trainer.config.trainer.get("share_resource_between_train_logp_ref_logp", True)
     
     async def get_input_data(self) -> Optional[Any]:
         """Block getting dataloader; wait for generate data to arrive"""
@@ -249,12 +279,15 @@ class RolloutStateMachine(BaseRoleStateMachine):
         push_tasks = []
         
         if self.pipeline.is_in_pipeline("logp"):
+            enhanced_print("rollout", None, f"Pushing to logp for step {data['step']}")
             push_tasks.append(self.pipeline.push("rollout", "logp", (data["step"], batch)))
         
         if self.pipeline.is_in_pipeline("ref_logp"):
+            enhanced_print("rollout", None, f"Pushing to ref_logp for step {data['step']}")
             push_tasks.append(self.pipeline.push("rollout", "ref_logp", (data["step"], batch)))
         
         if self.pipeline.is_in_pipeline("reward"):
+            enhanced_print("rollout", None, f"Pushing to reward for step {data['step']}")
             push_tasks.append(self.pipeline.push("rollout", "reward", (data["step"], batch)))
         
         # Push to train
@@ -340,6 +373,14 @@ class TrainStateMachine(BaseRoleStateMachine):
         ref_logp_result = await self.pipeline.pull("ref_logp", "train")
         reward_result = await self.pipeline.pull(src_role="reward", dst_role="train")
         
+        # Wait for validation result if validation was triggered
+        validation_result = None
+        if "validation" in self.pipeline.role:
+            # Check if validation was actually performed (non-blocking)
+            validation_result = await self.pipeline.pull("validation", "train")
+            # If validation_result is None, it means validation was skipped for this step
+            # If validation_result is ("INITIAL_VALIDATION", val_metrics), it's initial validation
+
         # Check if all data is received
         if logp_result is None or ref_logp_result is None or reward_result is None:
             return None
@@ -350,6 +391,21 @@ class TrainStateMachine(BaseRoleStateMachine):
         
         # Verify step consistency
         assert logp_step == ref_logp_step == reward_step, f"Step mismatch: logp_step={logp_step}, ref_logp_step={ref_logp_step}, reward_step={reward_step}"
+        
+        # Process validation result if available
+        if validation_result is not None:
+            if len(validation_result) == 2:  # Actual validation results
+                val_step, val_metrics = validation_result
+                if val_step == "INITIAL_VALIDATION":
+                    enhanced_print("train", None, "Received initial validation results")
+                    # For initial validation, log directly
+                    if self.logger and val_metrics:
+                        self.logger.log(data=val_metrics, step=0)  # Log at step 0 for initial validation
+                else:
+                    enhanced_print("train", None, f"Received validation results for step {val_step}")
+                    # Store validation metrics for later logging with training metrics
+                    self.last_val_metrics = val_metrics
+            # If validation_result is None, validation was skipped for this step
         
         enhanced_print("train", None, f"Successfully assembled data for step {logp_step}")
         return (data, old_log_prob, ref_log_prob, reward_tensor, reward_extra_infos_dict)
@@ -504,8 +560,16 @@ class TrainStateMachine(BaseRoleStateMachine):
         n_gpus = self.trainer.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
-        # TODO: make a canonical logger that supports various backend
+        # Add validation metrics if available (following the pattern from other trainers)
+        if self.last_val_metrics is not None:
+            metrics.update(self.last_val_metrics)
+            enhanced_print("train", None, f"Added validation metrics to training metrics for step {self.trainer.global_steps}")
+
         self.logger.log(data=metrics, step=self.trainer.global_steps)
+        
+        # Clear validation metrics after logging to avoid duplicate logging
+        if self.last_val_metrics is not None:
+            self.last_val_metrics = None
 
         self.progress_bar.update(1)
         self.trainer.global_steps += 1
@@ -523,13 +587,20 @@ class TrainStateMachine(BaseRoleStateMachine):
             data = PIPELINE_END_SIGNAL
 
         global_steps = data
-        # Block push to param_update, ensure parameter update
+        
+        # 1. First, trigger param_update to ensure it gets resource lock first
         await self.pipeline.push(src_role="train", dst_role="param_update", data=global_steps)
         enhanced_print("train", None, f"Sent training completion signal for step {global_steps} to param_update")
 
-        # If train/logp/ref_logp share resources, block push to logp/ref_logp to ensure no resource contention
-        if self.trainer.config.trainer.get("share_resource_between_train_logp_ref_logp", True):
+        # 2. Trigger validation (if validation state machine exists)
+        if "validation" in self.pipeline.role:
+            await self.pipeline.push(src_role="train", dst_role="validation", data=global_steps)
+            enhanced_print("train", None, f"Sent validation trigger for step {global_steps} to validation")
+
+        # 3. Trigger logp/ref_logp for next step (these will wait for param_update signal)
+        if not self.trainer.config.trainer.get("sperated_train_logp", False):
             await self.pipeline.push(src_role="train", dst_role="logp", data=global_steps)
+        if not self.trainer.sperated_ref_model:
             await self.pipeline.push(src_role="train", dst_role="ref_logp", data=global_steps)
             enhanced_print("train", None, f"Sent training completion signal for step {global_steps} to logp/ref_logp")
         
@@ -562,7 +633,7 @@ class RewardStateMachine(BaseRoleStateMachine):
     
     @timing_decorator("reward")
     async def process_data(self, data: Any) -> Any:
-        """Process reward calculation logic - block execution to ensure correctness"""
+        """Process reward calculation logic - async execution using to_thread"""
         if data is None:
             enhanced_print("reward", None, "Received None data, waiting...")
             return None
@@ -576,18 +647,18 @@ class RewardStateMachine(BaseRoleStateMachine):
         reward_tensor = None
         reward_extra_infos_dict = {}
         
-        # Block execute reward calculation
+        # Use asyncio.to_thread for async computation (like generate)
+        enhanced_print("reward", None, f"Starting async reward computation using to_thread for step {step}")
+        
         if self.trainer.use_rm:
+            # RM computation (if needed)
             reward_tensor = self.trainer.rm_wg.compute_rm_score(batch)
-
-        if self.trainer.config.reward_model.launch_reward_fn_async:
-            future_reward = compute_reward_async.remote(batch, self.trainer.config, self.trainer.tokenizer)
-            # Need to wait for future_reward to complete, but now use sync version first
-            enhanced_print("reward", None, "Using async reward computation - converting to sync")
-            # reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.trainer.reward_fn)
-        else:
-            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.trainer.reward_fn)
-
+            batch = batch.union(reward_tensor)
+        
+        # Launch async reward computation using to_thread
+        reward_tensor, reward_extra_infos_dict = await asyncio.to_thread(compute_reward, batch, self.trainer.reward_fn)
+        enhanced_print("reward", None, f"Async reward computation completed for step {step}")
+        
         return (step, reward_tensor, reward_extra_infos_dict)
     
     async def send_output_data(self, data: Any) -> bool:
@@ -597,7 +668,9 @@ class RewardStateMachine(BaseRoleStateMachine):
         if data == "END":
             # no need to send to train queue
             return True
+        
         step, reward_tensor, reward_extra_infos_dict = data
+        
         # Block send results, ensure train can receive data
         await self.pipeline.push("reward", "train", (step, reward_tensor, reward_extra_infos_dict))
         enhanced_print("reward", None, f"Sent reward result for step {step}")
@@ -628,12 +701,17 @@ class LogPStateMachine(BaseRoleStateMachine):
             if batch == PIPELINE_END_SIGNAL:
                 return "END"
             
-            # If logp/ref_logp and train share resources, wait for train's previous step to complete
-            if self.trainer.config.trainer.get("share_resource_between_train_logp_ref_logp", True):
-                enhanced_print("logp", None, f"Waiting for train to complete")
-                await self.pipeline.pull("train", "logp")
-                
-                enhanced_print("logp", None, f"Train step completed, continuing with logp")
+            # Always wait for train to complete before logp to ensure proper resource lock order
+            # This ensures: train -> param_update -> logp sequence
+            enhanced_print("logp", None, f"Waiting for train to complete")
+            await self.pipeline.pull("train", "logp")
+            enhanced_print("logp", None, f"Train step completed, continuing with logp")
+            
+            # Wait for param_update to complete before logp (unless separated deployment)
+            if not self.trainer.config.trainer.get("sperated_train_logp", False):
+                enhanced_print("logp", None, f"Waiting for param_update to complete")
+                await self.pipeline.pull("param_update", "logp")
+                enhanced_print("logp", None, f"Param_update completed, continuing with logp")
             return batch
         except Exception as ex:
             enhanced_print("logp", None, f"Error in get_input_data: {ex}")
@@ -641,7 +719,7 @@ class LogPStateMachine(BaseRoleStateMachine):
     
     @timing_decorator("logp")
     async def process_data(self, data: Any) -> Any:
-        """Process LogP calculation logic - block execution to ensure correctness"""
+        """Process LogP calculation logic - async execution"""
         if data is None:
             enhanced_print("logp", None, "Received None data, waiting...")
             return None
@@ -653,17 +731,23 @@ class LogPStateMachine(BaseRoleStateMachine):
             return "END"
         enhanced_print("logp", None, f"Computing logp for step {step}")
         
-        # Acquire resource lock, pass step parameter
+        # Acquire resource lock before launching async task
         await resource_lock.acquire("logp", step)
         
-        # Block execute LogP calculation (direct call, not using asyncio.to_thread)
-        enhanced_print("logp", None, f"Starting LogP computation for step {step}")
-        old_log_prob = self.trainer.actor_wg.compute_log_prob(batch)
-        enhanced_print("logp", None, f"LogP computation finished for step {step}")
+        # Use asyncio.to_thread for async computation (like ref_logp and reward)
+        enhanced_print("logp", None, f"Starting async LogP computation using to_thread for step {step}")
         
-        # Release resource lock
+        def compute_logp_sync():
+            return self.trainer.actor_wg.compute_log_prob(batch)
+        
+        # Launch async computation using to_thread
+        old_log_prob = await asyncio.to_thread(compute_logp_sync)
+        enhanced_print("logp", None, f"Async LogP computation completed for step {step}")
+        
+        # Release resource lock after computation is complete
         await resource_lock.release("logp")
         
+        # Return result directly (no future needed)
         return (step, old_log_prob)
     
     async def send_output_data(self, data: Any) -> bool:
@@ -674,12 +758,13 @@ class LogPStateMachine(BaseRoleStateMachine):
             # no need to send to train queue
             return True
         
-        step, logp_result = data
+        step, old_log_prob = data
+        
         # Block send results, ensure train can receive data
-        await self.pipeline.push("logp", "train", (step, logp_result))
+        await self.pipeline.push("logp", "train", (step, old_log_prob))
         enhanced_print("logp", None, f"Sent logp result for step {step}")
 
-        if self.trainer.config.trainer.get("share_resource_between_train_logp_ref_logp", True):
+        if not self.trainer.sperated_ref_model:
             await self.pipeline.push("logp", "ref_logp", step)
         return True
 
@@ -693,6 +778,10 @@ class RefLogPStateMachine(BaseRoleStateMachine):
     def __init__(self, pipeline, trainer):
         super().__init__("ref_logp", pipeline)
         self.trainer = trainer
+        self.sperated_ref_model = self.trainer.sperated_ref_model
+        # set offpolicy steps: generate ahead param_update
+        self.generate_ahead_steps = trainer.config.trainer.get("generate_ahead_steps", 3)
+        enhanced_print("ref_logp", None, f"Using sperated_ref_model: {self.sperated_ref_model}")
         
     async def get_input_data(self) -> Optional[Any]:
         """Block getting reference LogP calculation data, ensure dependencies"""
@@ -705,8 +794,7 @@ class RefLogPStateMachine(BaseRoleStateMachine):
             if batch is None:
                 enhanced_print("ref_logp", None, "Received None from rollout, waiting...")
                 return None
-            
-            if self.trainer.config.trainer.get("share_resource_between_train_logp_ref_logp", True):
+            if not self.sperated_ref_model:
                 enhanced_print("ref_logp", None, f"Waiting for train to complete")
                 await self.pipeline.pull("train", "ref_logp")
                 await self.pipeline.pull("logp", "ref_logp")
@@ -718,7 +806,7 @@ class RefLogPStateMachine(BaseRoleStateMachine):
     
     @timing_decorator("ref_logp")
     async def process_data(self, data: Any) -> Any:
-        """Process reference LogP calculation logic - block execution to ensure correctness"""
+        """Process reference LogP calculation logic - async execution using to_thread"""
         if data is None:
             enhanced_print("ref_logp", None, "Received None data, waiting...")
             return None
@@ -731,19 +819,28 @@ class RefLogPStateMachine(BaseRoleStateMachine):
             return "END"
         enhanced_print("ref_logp", None, f"Computing ref_logp for step {step}")
 
-        # Acquire resource lock, pass step parameter
-        await resource_lock.acquire("ref_logp", step)
+        # Acquire resource lock if not separated (for shared resources)
+        if not self.sperated_ref_model:
+            await resource_lock.acquire("ref_logp", step)
+            enhanced_print("ref_logp", None, f"Acquired resource lock for step {step}")
+
+        # Use asyncio.to_thread for async computation (like generate)
+        enhanced_print("ref_logp", None, f"Starting async Ref LogP computation using to_thread for step {step}")
         
-        # Block execute reference LogP calculation (direct call, not using asyncio.to_thread)
-        enhanced_print("ref_logp", None, f"Starting Ref LogP computation for step {step}")
-        if not self.trainer.ref_in_actor:
-            ref_log_prob = self.trainer.ref_policy_wg.compute_ref_log_prob(batch)
-        else:
-            ref_log_prob = self.trainer.actor_wg.compute_ref_log_prob(batch)
-        enhanced_print("ref_logp", None, f"Ref LogP computation finished for step {step}")
+        def compute_ref_logp_sync():
+            if not self.trainer.ref_in_actor:
+                return self.trainer.ref_policy_wg.compute_ref_log_prob(batch)
+            else:
+                return self.trainer.actor_wg.compute_ref_log_prob(batch)
         
-        # Release resource lock
-        await resource_lock.release("ref_logp")
+        # Launch async computation using to_thread
+        ref_log_prob = await asyncio.to_thread(compute_ref_logp_sync)
+        enhanced_print("ref_logp", None, f"Async Ref LogP computation completed for step {step}")
+        
+        # Release resource lock if not separated
+        if not self.sperated_ref_model:
+            await resource_lock.release("ref_logp")
+            enhanced_print("ref_logp", None, f"Released resource lock for step {step}")
         
         return (step, ref_log_prob)
     
@@ -755,15 +852,16 @@ class RefLogPStateMachine(BaseRoleStateMachine):
             # no need to send to train queue
             return True
         
-        step, ref_logp_result = data
+        step, ref_log_prob = data
+        
         # Block send results, ensure train can receive data
-        await self.pipeline.push("ref_logp", "train", (step, ref_logp_result))
+        await self.pipeline.push("ref_logp", "train", (step, ref_log_prob))
         enhanced_print("ref_logp", None, f"Sent ref_logp result for step {step}")
         return True
 
 
 class ParamUpdateStateMachine(BaseRoleStateMachine):
-    """asyncRLparameterupdatestate machine - 使用param_update.py中的方法进行asyncsynchronization"""
+    """asyncRLparameterupdatestate machine"""
     
     def __init__(self, pipeline, trainer):
         super().__init__("param_update", pipeline)
@@ -779,7 +877,6 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
             "max_time": 0.0
         }
         
-        # 检查trainer是否有param_update_manager
         rollout_wg = self.trainer.rollout_wg
         actor_wg = self.trainer.actor_wg
         self.has_param_update_manager = hasattr(actor_wg, 'async_param_update')
@@ -790,7 +887,7 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
             enhanced_print("AsyncRLParamUpdate", None, "param_update_manager not available, falling back to sync update")
     
     async def get_input_data(self) -> Optional[Any]:
-        """gettingparameterupdate请求"""
+        """getting parameter update"""
         try:
             data = await self.pipeline.pull("train", "param_update")
             if data == PIPELINE_END_SIGNAL:
@@ -808,7 +905,7 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
     
     @timing_decorator("param_update")
     async def process_data(self, data: Any) -> Any:
-        """Processparameterupdate请求 - 后台线程execute"""
+        """Process parameter update"""
         if data == "END":
             return "END"
         elif data is None:
@@ -819,43 +916,35 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
 
         enhanced_print("param_update", None, f"Starting param update for step {global_steps}")
         
-        # 记录开始时间
         start_time = time.time()
-        # 后续step在后台线程中execute，不阻塞主流程
         if self.has_param_update_manager:
-            # 启动后台asyncparameterupdate任务
             param_update_task = asyncio.create_task(
                 self._perform_async_param_update_background(global_steps)
             )
             self.stats["async_updates"] += 1
             enhanced_print("param_update", None, f"Async param update task created for step {global_steps}")
         else:
-            # 启动后台synchronizationparameterupdate任务
             param_update_task = asyncio.create_task(
                 asyncio.to_thread(self._perform_sync_param_update_background, global_steps)
             )
             self.stats["sync_updates"] += 1
             enhanced_print("param_update", None, f"Sync param update task created for step {global_steps}")
         
-        # 立即return，不waitingparameterupdatecompleted
         task_creation_time = time.time() - start_time
-        
+
         enhanced_print("param_update", None, 
                         f"Param update task created for step {global_steps} in {task_creation_time:.3f}s (background execution)")
         
-        # return任务对象，让send_output_datawaitingcompleted
         return (global_steps, param_update_task)
 
     async def _perform_async_param_update_background(self, global_steps: int) -> bool:
-        """后台asyncparameterupdate - 后续step使用"""
+        """async parameter update """
         enhanced_print("param_update", None, f"Background async param update started for step {global_steps}")
-        
-        # getting锁（在后台线程中）
+
         await resource_lock.acquire("param_update", global_steps)
 
         start_time = time.time()
-        
-        # 使用param_update_manager的async_param_update方法
+
         self.trainer.actor_wg.async_param_update()
         self.trainer.rollout_wg.async_param_update()
         
@@ -863,8 +952,6 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
         self.trainer.actor_wg.wait_for_send_complete()
         
         update_time = time.time() - start_time
-        
-        # update统计
         self.stats["updates"] += 1
         self.stats["total_time"] += update_time
         self.stats["avg_time"] = self.stats["total_time"] / self.stats["updates"]
@@ -874,7 +961,6 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
         enhanced_print("param_update", None, 
                         f"Background async param update completed for step {global_steps} in {update_time:.3f}s")
         
-        # 释放锁
         await resource_lock.release("param_update", global_steps)
 
         return True
@@ -919,7 +1005,7 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
         
 
     async def send_output_data(self, data: Any) -> bool:
-        """sendupdatecompleted信号 - waitingasync任务completed后push"""
+        """send update completed"""
         if data == "END":
             enhanced_print("param_update", None, "Async param update completed, END signal processed")
             await self.pipeline.push("param_update", "generate", PIPELINE_END_SIGNAL)
@@ -927,25 +1013,27 @@ class ParamUpdateStateMachine(BaseRoleStateMachine):
         elif data is None:
             return False
         
-        # 检查是否是任务对象
         if isinstance(data, tuple) and len(data) == 2:
             global_steps, param_update_task = data
             enhanced_print("param_update", None, f"Waiting for background param update task to complete for step {global_steps}")
-            
-            # waiting后台任务completed
+
             success = await param_update_task
             if success:
                 enhanced_print("param_update", None, f"Background param update completed for step {global_steps}")
             else:
                 enhanced_print("param_update", None, f"Background param update failed for step {global_steps}")
         else:
-            # 第一个step的情况，data就是global_steps
             global_steps = data
-        
-        # unified在这里Processpush操作
+
         enhanced_print("param_update", None, f"Sending completion signal to generate for step {global_steps}")
         await self.pipeline.push("param_update", "generate", global_steps)
         enhanced_print("param_update", None, f"Sent completion signal to generate for step {global_steps}")
+        
+        # Send signal to logp to continue (unless separated deployment)
+        if not self.trainer.config.trainer.get("sperated_train_logp", False):
+            await self.pipeline.push("param_update", "logp", global_steps)
+            enhanced_print("param_update", None, f"Sent completion signal to logp for step {global_steps}")
+        
         return True
     
     def get_status_info(self) -> Dict[str, Any]:
@@ -971,7 +1059,8 @@ class GenerateStateMachine(BaseRoleStateMachine):
         self.first_generation = True
         
         # set offpolicy steps: generate ahead param_update
-        self.generate_ahead_steps = trainer.config.trainer.get("generate_ahead_steps", 3)
+        # +1 because the first generation is not offpolicy
+        self.generate_ahead_steps = trainer.config.trainer.get("generate_ahead_steps", 2) + 1
         self.last_param_update_step = 0
 
         enhanced_print("generate", None, f"Configured generate ahead: {self.generate_ahead_steps} steps")
@@ -987,6 +1076,10 @@ class GenerateStateMachine(BaseRoleStateMachine):
         
         step, gen_batch = data
         enhanced_print("generate", None, f"Starting generation task for step {step}")
+        
+        # Acquire engine resource lock before starting generation
+        await engine_resource_lock.acquire("generate")
+        enhanced_print("generate", None, f"Acquired engine resource lock for step {step}")
         
         generation_task = asyncio.create_task(
             asyncio.to_thread(self._generate_sync, gen_batch, step)
@@ -1017,6 +1110,10 @@ class GenerateStateMachine(BaseRoleStateMachine):
                 raise Exception(f"Generation failed for step {step}")
             
             enhanced_print("generate", None, f"Background generation completed for step {step}")
+            
+            # Release engine resource lock after generation is complete
+            await engine_resource_lock.release("generate")
+            enhanced_print("generate", None, f"Released engine resource lock for step {step}")
 
         else:
             step, gen_batch_output = data
@@ -1058,7 +1155,6 @@ class GenerateStateMachine(BaseRoleStateMachine):
             return None
             
         step, gen_batch = data
-        
         # Check the distance between generate and param_update. 
         # If it is too far, Blocking to waiting param_update.
         while step > self.last_param_update_step + self.generate_ahead_steps:
@@ -1105,6 +1201,152 @@ class GenerateStateMachine(BaseRoleStateMachine):
         }
 
 
+class ValidationStateMachine(BaseRoleStateMachine):
+    """Validation state machine for periodic validation during training"""
+    # input: 
+    #   train -> validation (validation trigger)
+    # output:
+    #   validation -> train (validation results)
+    
+    def __init__(self, pipeline, trainer):
+        super().__init__("validation", pipeline)
+        self.trainer = trainer
+        self.validation_freq = self.trainer.config.trainer.get("test_freq", 100)
+        self.last_validation_step = 0
+        self.initial_validation_done = False
+        self.val_before_train = self.trainer.config.trainer.get("val_before_train", True)
+        self.val_only = self.trainer.config.trainer.get("val_only", False)
+        enhanced_print("validation", None, f"Validation frequency: {self.validation_freq}, val_before_train: {self.val_before_train}")
+    
+    async def get_input_data(self) -> Optional[Any]:
+        """Get validation trigger from train or perform initial validation"""
+        try:
+            # Check if we need to perform initial validation before training
+            if not self.initial_validation_done and self.val_before_train and self.trainer.val_reward_fn is not None:
+                enhanced_print("validation", None, "Performing initial validation before training")
+                self.initial_validation_done = True
+                return "INITIAL_VALIDATION"
+            
+            # Block waiting for validation trigger from train
+            trigger = await self.pipeline.pull("train", "validation")
+            
+            if trigger is None:
+                return None
+            
+            if trigger == PIPELINE_END_SIGNAL:
+                return "END"
+            
+            # Check if validation should be performed
+            current_step = trigger
+            if current_step - self.last_validation_step >= self.validation_freq:
+                self.last_validation_step = current_step
+                enhanced_print("validation", None, f"Validation triggered for step {current_step}")
+                return current_step
+            else:
+                enhanced_print("validation", None, f"Validation skipped for step {current_step}, next at {self.last_validation_step + self.validation_freq}")
+                # Send None to indicate validation was skipped
+                await self.pipeline.push("validation", "train", None)
+                return None
+                
+        except Exception as ex:
+            enhanced_print("validation", None, f"Error in get_input_data: {ex}")
+            return None
+    
+    @timing_decorator("validation")
+    async def process_data(self, data: Any) -> Any:
+        """Process validation logic using to_thread"""
+        if data is None:
+            return None
+        
+        if data == "END":
+            return "END"
+        
+        if data == "INITIAL_VALIDATION":
+            enhanced_print("validation", None, "Starting initial validation before training")
+            
+            # Acquire both dataloader scheduler lock and engine resource lock for validation
+            await dataloader_scheduler_lock.acquire("validation_dataloader")
+            await engine_resource_lock.acquire("validation")
+            enhanced_print("validation", None, "Acquired dataloader scheduler lock and engine resource lock for validation")
+            
+            try:
+                # Use asyncio.to_thread for validation computation
+                def validate_sync():
+                    return self.trainer._validate()
+                val_metrics = await asyncio.to_thread(validate_sync)
+                
+                enhanced_print("validation", None, "Async initial validation computation completed")
+                
+                # Check if val_only mode is enabled
+                if self.val_only:
+                    enhanced_print("validation", None, "val_only mode enabled, stopping after initial validation")
+                    return "VAL_ONLY_END"
+                
+                return ("INITIAL_VALIDATION", val_metrics)
+            finally:
+                # Release both locks after validation
+                await engine_resource_lock.release("validation")
+                await dataloader_scheduler_lock.release("validation_dataloader")
+                enhanced_print("validation", None, "Released dataloader scheduler lock and engine resource lock for validation")
+        
+        step = data
+        enhanced_print("validation", None, f"Starting validation for step {step}")
+        
+        # Acquire both dataloader scheduler lock and engine resource lock for validation
+        await dataloader_scheduler_lock.acquire("validation_dataloader")
+        await engine_resource_lock.acquire("validation")
+        enhanced_print("validation", None, f"Acquired dataloader scheduler lock and engine resource lock for validation step {step}")
+        
+        try:
+            # Use asyncio.to_thread for validation computation
+            def validate_sync():
+                return self.trainer._validate()
+            val_metrics = await asyncio.to_thread(validate_sync)
+            
+            enhanced_print("validation", None, f"Async validation computation completed for step {step}")
+            
+            return (step, val_metrics)
+        finally:
+            # Release both locks after validation
+            await engine_resource_lock.release("validation")
+            await dataloader_scheduler_lock.release("validation_dataloader")
+            enhanced_print("validation", None, f"Released dataloader scheduler lock and engine resource lock for validation step {step}")
+    
+    async def send_output_data(self, data: Any) -> bool:
+        """Send validation results back to train"""
+        if data is None:
+            return False
+        if data == "END":
+            return True
+        if data == "VAL_ONLY_END":
+            # Send end signal to all state machines
+            for role_name in ["dataloader", "rollout", "train", "generate", "reward", "logp", "ref_logp", "param_update"]:
+                if role_name in self.pipeline.role:
+                    await self.pipeline.push("validation", role_name, PIPELINE_END_SIGNAL)
+            enhanced_print("validation", None, "Sent end signal to all state machines due to val_only mode")
+            return True
+        
+        step, val_metrics = data
+        
+        # Handle initial validation results
+        if step == "INITIAL_VALIDATION":
+            # For initial validation, log directly and send to train
+            enhanced_print("validation", None, f"Initial validation metrics: {val_metrics}")
+            if self.trainer.config.trainer.get("val_only", False):
+                # In val_only mode, just log and end
+                return True
+            else:
+                # Send initial validation results to train
+                await self.pipeline.push("validation", "train", (step, val_metrics))
+                enhanced_print("validation", None, "Sent initial validation results to train")
+                return True
+        
+        # Send validation results back to train
+        await self.pipeline.push("validation", "train", (step, val_metrics))
+        enhanced_print("validation", None, f"Sent validation results for step {step}")
+        return True
+
+
 def create_role_state_machine(role_name: str, pipeline, trainer, use_async_rl: bool = False) -> BaseRoleStateMachine:
     """
     Create a role state machine factory function
@@ -1124,6 +1366,7 @@ def create_role_state_machine(role_name: str, pipeline, trainer, use_async_rl: b
         "logp": LogPStateMachine,
         "ref_logp": RefLogPStateMachine,
         "train": TrainStateMachine,
+        "validation": ValidationStateMachine,
     }
     enhanced_print("create_role_state_machine", None, 
                  f"Creating {role_name} state machine with async RL optimizations (dual buffer + interruptible generation)")

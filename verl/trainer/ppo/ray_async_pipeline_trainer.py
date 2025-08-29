@@ -70,6 +70,9 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
         self._overlap_param_update = self.config.actor_rollout_ref.get("overlap_param_update", True)
         self._async_logp_ref_logp = self.config.actor_rollout_ref.get("async_logp_ref_logp", True)
         self._async_pipeline = AsyncPipeline(max_queue_size=self.config.actor_rollout_ref.rollout.get("max_queue_size", 2))        
+        from verl.trainer.ppo.pipeline.utils import is_ref_model_separated
+        sperated_node_tasks = self.config.trainer.sperated_node_tasks
+        self.sperated_ref_model = is_ref_model_separated(sperated_node_tasks)
         if not self._async_logp_ref_logp:
             print(f"roles in async pipeline: {self._async_pipeline.role}", flush=True)
             self._async_pipeline.role.remove("logp")
@@ -78,6 +81,9 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
         self.global_steps = 0
         self.dataloader_global_step = 0
         self.generate_global_step = 0
+        
+        # Store original actor_rollout_wg for validation compatibility
+        self._original_actor_rollout_wg = None
 
 
     def init_workers(self):
@@ -143,7 +149,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
 
         # breakpoint()
         
-        async_pipline_init = self.config.trainer.get("async_pipeline", False)
+        self.async_pipline_init = self.config.trainer.get("async_pipeline", False)
         
         _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         atexit.register(_executor.shutdown, wait=True)
@@ -166,7 +172,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
 
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = all_wg["ref"]
-            if async_pipline_init:
+            if self.async_pipline_init:
                 _async_tasks.append(_executor.submit(self.ref_policy_wg.init_model))
             else:
                 self.ref_policy_wg.init_model()
@@ -186,7 +192,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
             self.actor_wg = all_wg["actor"]
             self.rollout_wg = all_wg["rollout"]
             
-            if async_pipline_init:
+            if self.async_pipline_init:
                 print(f"===== initializing actor worker asynchronously =====", flush=True)
                 # Use the executor to run the actor initialization in a separate thread
                 _async_tasks.append(_executor.submit(self.actor_wg.init_model))
@@ -202,7 +208,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
             for task in _async_tasks:
                 task.result()
 
-        if async_pipline_init:
+        if self.async_pipline_init:
             members = self.actor_wg.workers + self.rollout_wg.workers
             col_size = len(members)
             col_name = "actor_rollout_sync"
@@ -252,7 +258,7 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
             self.rollout_wg.set_params_meta(param_meta)
         
         t3 = time.time()
-        print(f"===== finished async_pipline:{async_pipline_init} initializing workers in {t3 - t2:.2f},{t2-t1:.2f} seconds =====", flush=True)
+        print(f"===== finished async_pipline:{self.async_pipline_init} initializing workers in {t3 - t2:.2f},{t2-t1:.2f} seconds =====", flush=True)
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -857,3 +863,31 @@ class RayPPOAsyncPipelineTrainer(RayPPOTrainer):
             use_async_rl=not use_blocking_mode,
         )
         asyncio.run(enhanced_trainer.run_state_machine_pipeline())
+    
+    def _validate(self):
+        """
+        Override _validate method to use rollout_wg instead of actor_rollout_wg for async pipeline
+        This ensures validation uses the correct worker group for generation
+        """
+        # Store original actor_rollout_wg
+        self._original_actor_rollout_wg = self.rollout_wg if self.async_pipline_init else self.actor_rollout_wg
+
+        # Determine which worker group to use for validation based on async training
+        # In async training, actor and generate are separated, so use rollout_wg
+        if hasattr(self, 'rollout_wg'):
+            # Async training: use rollout_wg for validation
+            self.actor_rollout_wg = self.rollout_wg
+            # override generate_sequences to use generate_sequences_sperated
+            self.actor_rollout_wg.generate_sequences = self.actor_rollout_wg.generate_sequences_sperated
+            enhanced_print("validation", None, "Using rollout_wg for validation (async training)")
+        else:
+            # Non-async training: use original actor_rollout_wg
+            enhanced_print("validation", None, "Using actor_rollout_wg for validation (non-async training)")
+        
+        try:
+            # Call parent's _validate method
+            result = super()._validate()
+            return result
+        finally:
+            # Restore original actor_rollout_wg
+            self.actor_rollout_wg = self._original_actor_rollout_wg
