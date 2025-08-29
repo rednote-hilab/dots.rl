@@ -168,8 +168,7 @@ def timing_decorator(role_name: str):
                     elif role_name == "generate":
                         step_info = self.trainer.generate_global_step
                     else:
-                        # global step has been updated in the trainer
-                        step_info = self.trainer.global_steps - 1
+                        step_info = self.trainer.global_steps
                 elif isinstance(data, tuple) and len(data) > 0:
                     step_info = data[0]
                 elif isinstance(data, dict) and 'step' in data:

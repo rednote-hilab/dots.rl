@@ -1060,8 +1060,8 @@ class GenerateStateMachine(BaseRoleStateMachine):
         self.first_generation = True
         
         # set offpolicy steps: generate ahead param_update
-        # -1 because the first generation is not offpolicy
-        self.generate_ahead_steps = trainer.config.trainer.get("generate_ahead_steps", 2) - 1
+        # +1 because the first generation is not offpolicy
+        self.generate_ahead_steps = trainer.config.trainer.get("generate_ahead_steps", 2) + 1
         self.last_param_update_step = 0
 
         enhanced_print("generate", None, f"Configured generate ahead: {self.generate_ahead_steps} steps")
