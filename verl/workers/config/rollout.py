@@ -106,11 +106,15 @@ class RolloutConfig(BaseConfig):
     tensor_model_parallel_size: int = 2
     pipeline_model_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
-    
+
     # add by async-rl
     enable_dual_buffer: bool = False
+    enable_param_async: bool = False
     param_update_preduce_bucket_size_mb: int = 512
     param_update_consume_bucket_size_mb: int = 128
+
+    # Memory optimization: use single buffer to reduce CPU memory usage
+    memory_efficient_mode: bool = True
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)

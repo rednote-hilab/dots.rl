@@ -1,11 +1,10 @@
-# coding=utf-8
-# Copyright 2023 XdgMoE-AI and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 hilab team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
 # and OPT implementations in this library. It has been modified from its
 # original forms to accommodate minor architectural differences compared
 # to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -17,18 +16,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-print('--------------Shared Modeling---------------')
-""" PyTorch XdgMoE model."""
+"""PyTorch XdgMoE model."""
+
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
@@ -37,7 +35,12 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
+    TokenClassifierOutput,
+)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
@@ -49,9 +52,8 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
-from .configuration_xdgmoe import XdgMoEConfig
-from transformers.modeling_outputs import TokenClassifierOutput
 
+from .configuration_xdgmoe import XdgMoEConfig
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -86,7 +88,9 @@ def _get_unpad_data(attention_mask):
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     warnings.warn(
-        "Calling `transformers.models.XdgMoE.modeling_XdgMoE._prepare_4d_attention_mask` is deprecated and will be removed in v4.37. Use `transformers.modeling_attn_mask_utils._prepare_4d_attention_mask"
+        "Calling `transformers.models.XdgMoE.modeling_XdgMoE._prepare_4d_attention_mask` is deprecated "
+        "and will be removed in v4.37. Use `transformers.modeling_attn_mask_utils._prepare_4d_attention_mask",
+        stacklevel=2,
     )
     return _prepare_4d_attention_mask(mask=mask, dtype=dtype, tgt_len=tgt_len)
 
@@ -95,7 +99,10 @@ def _make_causal_mask(
     input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
 ):
     warnings.warn(
-        "Calling `transformers.models.XdgMoE.modeling_XdgMoE._make_causal_mask` is deprecated and will be removed in v4.37. Use `transformers.models.XdgMoE.modeling_XdgMoE.AttentionMaskConverter._make_causal_mask"
+        "Calling `transformers.models.XdgMoE.modeling_XdgMoE._make_causal_mask` is deprecated "
+        "and will be removed in v4.37. Use "
+        "`transformers.models.XdgMoE.modeling_XdgMoE.AttentionMaskConverter._make_causal_mask",
+        stacklevel=2,
     )
     return AttentionMaskConverter._make_causal_mask(
         input_ids_shape=input_ids_shape, dtype=dtype, device=device, past_key_values_length=past_key_values_length
@@ -137,7 +144,6 @@ class XdgMoERotaryEmbedding(nn.Module):
             seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
         )
         self.max_seq_len_cached = None
-
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
@@ -249,7 +255,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 
 class XdgMoEMLP(nn.Module):
-    def __init__(self, config, hidden_size = None, intermediate_size = None):
+    def __init__(self, config, hidden_size=None, intermediate_size=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
@@ -267,9 +273,7 @@ class XdgMoEMLP(nn.Module):
             up_proj_slices = self.up_proj.weight.split(slice, dim=0)
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
 
-            gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
-            )
+            gate_proj = torch.cat([F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
             up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
 
             intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
@@ -307,24 +311,24 @@ class MoEGate(nn.Module):
         self.inspect3 = nn.Identity()
         self.inspect4 = nn.Identity()
 
-
     def reset_parameters(self) -> None:
-        import torch.nn.init  as init
+        import torch.nn.init as init
+
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-    
+
     def forward(self, hidden_states):
-        bsz, seq_len, h = hidden_states.shape        
+        bsz, seq_len, h = hidden_states.shape
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
         if self.config.moe_gating_fp32:
             logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32), None)
         else:
             logits = F.linear(hidden_states, self.weight, None)
-        if self.scoring_func == 'softmax':
+        if self.scoring_func == "softmax":
             scores = logits.softmax(dim=-1, dtype=torch.float32).type_as(logits)
             ### select top-k experts
             topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-        elif self.scoring_func == 'aux_loss_post_softmax':
+        elif self.scoring_func == "aux_loss_post_softmax":
             # TODO: training not supported
             topk_weight, topk_idx = torch.topk(logits, k=self.top_k, dim=1, sorted=False)
             topk_weight = torch.softmax(topk_weight, dim=-1, dtype=torch.float32).type_as(logits)
@@ -335,15 +339,14 @@ class MoEGate(nn.Module):
             _, topk_idx = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)
             topk_weight = scores.gather(1, topk_idx)
         else:
-            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
-        
+            raise NotImplementedError(f"insupportable scoring function for MoE gating: {self.scoring_func}")
+
         ### norm gate to sum 1
         if self.top_k > 1 and (self.norm_topk_prob or self.scoring_func == "noaux_tc"):
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
         topk_weight = topk_weight * self.config.routed_scaling_factor
-        
-        
+
         ### expert-level computation auxiliary loss
         if self.training and self.alpha > 0.0:
             scores_for_aux = scores
@@ -374,9 +377,10 @@ class MoEGate(nn.Module):
 
 class AddAuxiliaryLoss(torch.autograd.Function):
     """
-    The trick function of adding auxiliary (aux) loss, 
+    The trick function of adding auxiliary (aux) loss,
     which includes the gradient of the aux loss during backpropagation.
     """
+
     @staticmethod
     def forward(ctx, x, loss):
         assert loss.numel() == 1
@@ -390,29 +394,29 @@ class AddAuxiliaryLoss(torch.autograd.Function):
         if ctx.required_aux_loss:
             grad_loss = torch.ones(1, dtype=ctx.dtype, device=grad_output.device)
         return grad_output, grad_loss
-    
-    
+
+
 class XdgMoEMoE(nn.Module):
     """
     A mixed expert module containing shared experts.
     """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.experts = nn.ModuleList([XdgMoEMLP(config, intermediate_size = config.moe_intermediate_size) for i in range(config.n_routed_experts)])
+        self.experts = nn.ModuleList(
+            [XdgMoEMLP(config, intermediate_size=config.moe_intermediate_size) for i in range(config.n_routed_experts)]
+        )
         self.gate = MoEGate(config)
         self.assigned_tokens_per_expert = torch.zeros(
             config.n_routed_experts, device=torch.cuda.current_device(), dtype=torch.bfloat16
         )
-        self.router_expert_score_correction_coeff = (
-                self.config.router_expert_score_correction_coeff
-            )
+        self.router_expert_score_correction_coeff = self.config.router_expert_score_correction_coeff
         # self.ga_step = 0
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = XdgMoEMLP(config=config, intermediate_size = intermediate_size)
-
+            self.shared_experts = XdgMoEMLP(config=config, intermediate_size=intermediate_size)
 
     def reset_statistics(self):
         # 重置统计信息
@@ -424,8 +428,7 @@ class XdgMoEMoE(nn.Module):
         with torch.no_grad():
             self.gate.e_score_correction_bias.data = (
                 self.gate.e_score_correction_bias
-                + (mean_ - self.assigned_tokens_per_expert).sign()
-                * self.router_expert_score_correction_coeff
+                + (mean_ - self.assigned_tokens_per_expert).sign() * self.router_expert_score_correction_coeff
             )
 
         self.reset_statistics()
@@ -442,7 +445,7 @@ class XdgMoEMoE(nn.Module):
             for i, expert in enumerate(self.experts):
                 y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i]).to(hidden_states.dtype)
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y =  y.to(hidden_states.dtype).view(*orig_shape)
+            y = y.to(hidden_states.dtype).view(*orig_shape)
             self.assigned_tokens_per_expert += torch.bincount(flat_topk_idx, minlength=self.config.n_routed_experts)
             if aux_loss:
                 y = AddAuxiliaryLoss.apply(y, aux_loss)
@@ -451,7 +454,7 @@ class XdgMoEMoE(nn.Module):
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(identity)
         return y
-    
+
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
         expert_cache = torch.zeros_like(x, dtype=flat_expert_weights.dtype)
@@ -459,7 +462,7 @@ class XdgMoEMoE(nn.Module):
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
         token_idxs = idxs // self.num_experts_per_tok
         for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i-1]
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
             if start_idx == end_idx:
                 continue
             expert = self.experts[i]
@@ -467,7 +470,7 @@ class XdgMoEMoE(nn.Module):
             expert_tokens = x[exp_token_idx]
             expert_out = expert(expert_tokens).type_as(flat_expert_weights)
             expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            expert_cache.scatter_reduce_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out, reduce='sum')
+            expert_cache.scatter_reduce_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out, reduce="sum")
         return expert_cache.type_as(x)
 
 
@@ -521,7 +524,7 @@ class XdgMoEAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self._init_rope()
-        
+
         if self.qk_layernorm:
             self.q_layernorm = XdgMoERMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_layernorm = XdgMoERMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -569,10 +572,12 @@ class XdgMoEAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         if "padding_mask" in kwargs:
             warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
+                "Please make sure use `attention_mask` instead.`",
+                stacklevel=2,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -602,7 +607,7 @@ class XdgMoEAttention(nn.Module):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        
+
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
@@ -681,8 +686,11 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
         super().__init__(*args, **kwargs)
 
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is
+        # bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is
+        # used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case
+        # q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
     def forward(
@@ -694,11 +702,13 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         # XdgMoEFlashAttention2 attention does not support output_attentions
         if "padding_mask" in kwargs:
             warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
+                "Please make sure use `attention_mask` instead.`",
+                stacklevel=2,
             )
 
             # overwrite attention_mask with padding_mask
@@ -710,18 +720,18 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-         
+
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        
+
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
-        
+
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -731,7 +741,8 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+        # TODO: These transpose are quite inefficient but Flash Attention requires the layout
+        # [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
@@ -743,7 +754,7 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
         # cast them back in the correct dtype just to be sure everything works as expected.
         # This might slowdown training & inference so it is recommended to not cast the LayerNorms
         # in fp32. (XdgMoERMSNorm handles it correctly)
-        
+
         input_dtype = query_states.dtype
         if input_dtype == torch.float32:
             # Handle the case where the model is quantized
@@ -763,11 +774,11 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
             query_states = query_states.to(target_dtype)
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
-        
+
         attn_output = self._flash_attention_forward(
             query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
         )
-        
+
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 
@@ -801,7 +812,8 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
         if not self._flash_attn_uses_top_left_mask:
             causal = self.is_causal
         else:
-            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in XdgMoEFlashAttention2 __init__.
+            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1.
+            # For details, please see the comment in XdgMoEFlashAttention2 __init__.
             causal = self.is_causal and query_length != 1
 
         # Contains at least one padding token in the sequence
@@ -810,7 +822,7 @@ class XdgMoEFlashAttention2(XdgMoEAttention):
             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
                 query_states, key_states, value_states, attention_mask, query_length
             )
-            
+
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 
@@ -890,12 +902,15 @@ class XdgMoESdpaAttention(XdgMoEAttention):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"`
+            # once this is implemented.
             logger.warning_once(
-                "XdgMoEModel is using XdgMoESdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                "XdgMoEModel is using XdgMoESdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` "
+                "does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                "but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. "
+                'This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
             )
             return super().forward(
                 hidden_states=hidden_states,
@@ -915,7 +930,7 @@ class XdgMoESdpaAttention(XdgMoEAttention):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        
+
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
@@ -940,7 +955,8 @@ class XdgMoESdpaAttention(XdgMoEAttention):
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
 
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous
+        # inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and attention_mask is not None:
             query_states = query_states.contiguous()
@@ -953,7 +969,8 @@ class XdgMoESdpaAttention(XdgMoEAttention):
             value_states,
             attn_mask=attention_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
-            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not
+            # create a causal mask in case q_len == 1.
             is_causal=self.is_causal and attention_mask is None and q_len > 1,
         )
 
@@ -979,9 +996,15 @@ class XdgMoEDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.config = config
         self.self_attn = XdgMoE_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-        self.mlp = XdgMoEMoE(config) if (config.n_routed_experts is not None and  \
-                                           layer_idx >= config.first_k_dense_replace and layer_idx % config.moe_layer_freq == 0) \
-                                        else XdgMoEMLP(config)
+        self.mlp = (
+            XdgMoEMoE(config)
+            if (
+                config.n_routed_experts is not None
+                and layer_idx >= config.first_k_dense_replace
+                and layer_idx % config.moe_layer_freq == 0
+            )
+            else XdgMoEMLP(config)
+        )
         self.input_layernorm = XdgMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = XdgMoERMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -990,11 +1013,11 @@ class XdgMoEDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: Optional[tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -1011,7 +1034,9 @@ class XdgMoEDecoderLayer(nn.Module):
         """
         if "padding_mask" in kwargs:
             warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
+                "Please make sure use `attention_mask` instead.`",
+                stacklevel=2,
             )
         residual = hidden_states
 
@@ -1028,7 +1053,7 @@ class XdgMoEDecoderLayer(nn.Module):
             **kwargs,
         )
         hidden_states = residual + hidden_states
-        
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1200,14 +1225,13 @@ class XdgMoEModel(XdgMoEPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-        
+    ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1229,7 +1253,8 @@ class XdgMoEModel(XdgMoEPreTrainedModel):
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`transformers."
+                    "`use_cache=True` is incompatible with gradient checkpointing. "
+                    "Setting `use_cache=False`transformers."
                 )
                 use_cache = False
 
@@ -1364,7 +1389,7 @@ class XdgMoEForCausalLM(XdgMoEPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -1372,13 +1397,14 @@ class XdgMoEForCausalLM(XdgMoEPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         loss_mask: Optional[torch.Tensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> tuple | CausalLMOutputWithPast:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, transformers.,
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, transformers., config.vocab_size]`.
+                (masked), the loss is only computed for the tokens with labels in "
+                "`[0, transformers., config.vocab_size]`."
 
         Returns:
 
@@ -1417,7 +1443,7 @@ class XdgMoEForCausalLM(XdgMoEPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        
+
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
@@ -1528,7 +1554,6 @@ class XdgMoEForCausalLM(XdgMoEPreTrainedModel):
         pass
 
 
-
 @add_start_docstrings(
     """
     The XdgMoE Model transformer with a sequence classification head on top (linear layer).
@@ -1566,14 +1591,14 @@ class XdgMoEForSequenceClassification(XdgMoEPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
+    ) -> tuple | SequenceClassifierOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the sequence classification/regression loss. Indices should be in `[0, transformers.,
@@ -1651,8 +1676,6 @@ class XdgMoEForSequenceClassification(XdgMoEPreTrainedModel):
         )
 
 
-from transformers.modeling_outputs import TokenClassifierOutput
-
 class XdgMoEForTokenClassification(XdgMoEPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1719,3 +1742,6 @@ class XdgMoEForTokenClassification(XdgMoEPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+print("--------------Shared Modeling---------------")

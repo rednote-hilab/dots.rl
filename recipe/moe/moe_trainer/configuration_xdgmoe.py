@@ -1,9 +1,25 @@
+# Copyright 2025 hilab team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
 XdgMoE_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
+
+
 class XdgMoEConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`XdgMoEModel`]. It is used to instantiate an XdgMoE
@@ -109,19 +125,19 @@ class XdgMoEConfig(PretrainedConfig):
         vocab_size=102400,
         hidden_size=4096,
         intermediate_size=11008,
-        moe_intermediate_size = 1407,
+        moe_intermediate_size=1407,
         num_hidden_layers=30,
         num_attention_heads=32,
         num_key_value_heads=32,
-        n_shared_experts = None,
-        n_routed_experts = None,
-        num_experts_per_tok = None,
-        moe_layer_freq = 1,
-        first_k_dense_replace = 0,
-        norm_topk_prob = False,
-        scoring_func = 'softmax',
-        aux_loss_alpha = 0.001,
-        seq_aux = True,
+        n_shared_experts=None,
+        n_routed_experts=None,
+        num_experts_per_tok=None,
+        moe_layer_freq=1,
+        first_k_dense_replace=0,
+        norm_topk_prob=False,
+        scoring_func="softmax",
+        aux_loss_alpha=0.001,
+        seq_aux=True,
         hidden_act="silu",
         max_position_embeddings=2048,
         initializer_range=0.02,

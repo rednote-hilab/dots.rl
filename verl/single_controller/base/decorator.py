@@ -38,6 +38,7 @@ class Dispatch(DynamicEnum):
 def init_predefined_dispatch_mode():
     Dispatch.register("RANK_ZERO")
     Dispatch.register("ONE_TO_ALL")
+    Dispatch.register("ALL_TO_ONE")
     Dispatch.register("ALL_TO_ALL")
     Dispatch.register("DP_COMPUTE")
     Dispatch.register("DP_COMPUTE_PROTO")
@@ -131,6 +132,10 @@ def collect_all_to_all(worker_group, output):
     return output
 
 
+def collect_all_to_one(worker_group, output):
+    return output[0]
+
+
 def _concat_data_proto_or_future(output: list):
     import ray
 
@@ -191,6 +196,7 @@ def dispatch_dp_compute_data_proto_with_func(worker_group, *args, **kwargs):
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(worker_group.world_size, *args[1:], **kwargs)
     splitted_args_with_func = [[args[0]] * worker_group.world_size] + splitted_args
     return splitted_args_with_func, splitted_kwargs
+
 
 def collect_dp_compute_data_proto(worker_group, output):
     import ray
@@ -311,6 +317,10 @@ DISPATCH_MODE_FN_REGISTRY = {
     Dispatch.ONE_TO_ALL: {
         "dispatch_fn": dispatch_one_to_all,
         "collect_fn": collect_all_to_all,
+    },
+    Dispatch.ALL_TO_ONE: {
+        "dispatch_fn": dispatch_all_to_all,
+        "collect_fn": collect_all_to_one,
     },
     Dispatch.ALL_TO_ALL: {
         "dispatch_fn": dispatch_all_to_all,

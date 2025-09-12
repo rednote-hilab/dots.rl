@@ -22,7 +22,7 @@ import os
 import time
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, Optional, List, Tuple
+from typing import Any, List, Optional, Tuple
 from uuid import uuid4
 
 import numpy as np
@@ -166,7 +166,9 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.tp_size)],
+            serialized_named_tensors=[
+                MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.tp_size)
+            ],
             load_format=load_format,
             flush_cache=flush_cache,
         )
@@ -252,6 +254,7 @@ def _post_process_outputs(processing_class, output):
         batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
     return batched_output_token_ids, batched_logprobs
 
+
 def get_tool_call_parser_type(
     processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
 ) -> str:
@@ -315,7 +318,7 @@ class SGLangRollout(BaseRollout):
         self.config = config
         self._device_mesh_cpu = device_mesh
         self.sharding_manager = sharding_manager
-        
+
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
 
         (
@@ -353,9 +356,8 @@ class SGLangRollout(BaseRollout):
                 self.pad_token_id = self.processing_class.tokenizer.pad_token_id
             except AttributeError as e:
                 raise ValueError(f"Cannot get pad_token_id from processing_class {self.processing_class}") from e
-        
-        self.param_update_manager = kwargs.get('param_update_manager', None)
 
+        self.param_update_manager = kwargs.get("param_update_manager", None)
 
     def _init_distributed_env(self, device_mesh_cpu, **kwargs):
         self._device_mesh_cpu = device_mesh_cpu
@@ -477,11 +479,15 @@ class SGLangRollout(BaseRollout):
             rank = dist.get_rank()
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
-            enable_dual_buffer = getattr(self.config, 'enable_dual_buffer', False)
+            enable_dual_buffer = getattr(self.config, "enable_dual_buffer", False)
+            enable_param_async = getattr(self.config, "enable_param_async", False)
+
             if enable_dual_buffer:
-                print(f"[SGLangRollout] Initializing DualBufferAsyncEngine for dual buffer optimization")
+                print("[SGLangRollout] Initializing DualBufferAsyncEngine for dual buffer optimization")
                 from .dual_buffer_engine import DualBufferAsyncEngine
-                buffer_bucket_size_mb = getattr(self.config, 'param_update_consume_bucket_size_mb', 128)
+
+                buffer_bucket_size_mb = getattr(self.config, "param_update_consume_bucket_size_mb", 128)
+                memory_efficient_mode = getattr(self.config, "memory_efficient_mode", False)
                 self._engine = DualBufferAsyncEngine(
                     model_path=actor_module,
                     dtype=self.config.dtype,
@@ -510,12 +516,16 @@ class SGLangRollout(BaseRollout):
                     # In async mode for AgentLoop, SGLang support token in token out to avoid the tokenizer
                     # inconsistency issue.
                     skip_tokenizer_init=self.config.mode == "async",
+                    enable_param_async=enable_param_async,
                     bucket_size_mb=buffer_bucket_size_mb,
+                    memory_efficient_mode=memory_efficient_mode,
                     **engine_kwargs,
                 )
-                print(f"[SGLangRollout] DualBufferAsyncEngine initialized successfully")
+                # Set sharding_manager after engine creation (if available)
+                if self.sharding_manager is not None:
+                    self._engine.sharding_manager = self.sharding_manager
             else:
-                print(f"[SGLangRollout] Initializing standard AsyncEngine")
+                print("[SGLangRollout] Initializing standard AsyncEngine")
                 self._engine = AsyncEngine(
                     model_path=actor_module,
                     dtype=self.config.dtype,
@@ -630,16 +640,21 @@ class SGLangRollout(BaseRollout):
         return interaction_map
 
     def get_update_weight_func(self):
-        update_func_call = self._engine.update_buffer_data_only if hasattr(self, '_engine') and self._engine is not None else None
+        update_func_call = (
+            self._engine.update_buffer_data_only if hasattr(self, "_engine") and self._engine is not None else None
+        )
+        if update_func_call is None and self.sharding_manager is not None:
+            # other ranks call sharding_manager to update weights
+            update_func_call = self.sharding_manager.update_weights_sync
         return update_func_call
 
     def set_params_meta(self, params_meta):
-        if hasattr(self, '_engine') and self._engine is not None:
+        if hasattr(self, "_engine") and self._engine is not None:
             self._engine.set_params_meta(params_meta)
 
     def update_weight_from_dual_buffer(self):
         func_call = self.sharding_manager.update_weights
-        update_success = self._engine.execute_update_weights_before_generate(func_call)
+        self._engine.execute_update_weights_before_generate(func_call)
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
@@ -664,26 +679,26 @@ class SGLangRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
-        
-        is_dual_buffer = hasattr(self, '_engine') and self._engine is not None
-        enable_dual_buffer = getattr(self.config, 'enable_dual_buffer', False)
+
+        is_dual_buffer = hasattr(self, "_engine") and self._engine is not None
+        enable_dual_buffer = getattr(self.config, "enable_dual_buffer", False)
         if enable_dual_buffer and is_dual_buffer:
             self._wait_for_param_update_completion()
             self.update_weight_from_dual_buffer()
+        if enable_dual_buffer:
+            dist.barrier()
 
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
 
     def _wait_for_param_update_completion(self, timeout_seconds=150):
-        if not hasattr(self.param_update_manager, '_param_update_start_time'):
-            print("[SGLangRollout] No param_update started, skipping wait")
+        if not hasattr(self.param_update_manager, "_param_update_start_time"):
+            # print("[SGLangRollout] No param_update started, skipping wait")
             return
-        
-        start_time = self.param_update_manager._param_update_start_time
-        if hasattr(self, '_engine') and self._engine is not None:
+
+        if hasattr(self, "_engine") and self._engine is not None:
             self._engine.wait_for_buffer_write()
-            remaining = timeout_seconds - (time.time() - start_time)
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
@@ -842,10 +857,18 @@ class SGLangRollout(BaseRollout):
         )
         out = _post_process_outputs(self.processing_class, output)
 
-        response = out[0].to(idx.device)
+        use_gpu_tensor = False
+        if not use_gpu_tensor:
+            idx = idx.to("cpu", non_blocking=True)
+            attention_mask = attention_mask.to("cpu", non_blocking=True)
+            position_ids = position_ids.to("cpu", non_blocking=True)
+
+        target_device = idx.device if use_gpu_tensor else torch.device("cpu")
+
+        response = out[0].to(target_device)
         rollout_log_probs = None
         if self.config.calculate_log_probs:
-            rollout_log_probs = out[1].to(idx.device)
+            rollout_log_probs = out[1].to(target_device)
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
@@ -891,15 +914,17 @@ class SGLangRollout(BaseRollout):
 
         # free cache engine
         if self.config.free_cache_engine and self._engine is not None and self._tp_rank == 0:
-            import threading
             import concurrent.futures
+            import threading
+
             current_thread = threading.current_thread()
-            is_main_thread = current_thread.name == 'MainThread'
-            
+            is_main_thread = current_thread.name == "MainThread"
+
             if is_main_thread:
                 loop = asyncio.get_event_loop()
                 loop.run_until_complete(self._engine.flush_cache())
             else:
+
                 def run_async_flush_cache_in_new_thread():
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
@@ -907,6 +932,7 @@ class SGLangRollout(BaseRollout):
                         return loop.run_until_complete(self._engine.flush_cache())
                     finally:
                         loop.close()
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(run_async_flush_cache_in_new_thread)
                     try:
@@ -1710,9 +1736,8 @@ class SGLangRollout(BaseRollout):
         self.is_sleep = True
 
     def sync_per_tensor_generator(self):
-        if hasattr(self, 'param_update_manager') and self.param_update_manager is not None:            
-            if hasattr(self.param_update_manager, 'sync_per_tensor_generator'):
+        if hasattr(self, "param_update_manager") and self.param_update_manager is not None:
+            if hasattr(self.param_update_manager, "sync_per_tensor_generator"):
                 result = self.param_update_manager.sync_per_tensor_generator()
-                print(f"[SGLangRollout] param_update_manager.sync_per_tensor_generator completed")
+                print("[SGLangRollout] param_update_manager.sync_per_tensor_generator completed")
                 return result
-

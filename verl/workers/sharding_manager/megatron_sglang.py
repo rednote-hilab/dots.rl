@@ -20,10 +20,10 @@ This file contains a Megatron style Hybrid Engine that shares the weights of the
 import asyncio
 import logging
 import os
-import time
 
 from omegaconf import DictConfig
 from sglang.srt.entrypoints.engine import Engine
+
 try:
     from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 except Exception:
@@ -32,6 +32,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from verl.protocol import DataProto, all_gather_data_proto
+from verl.trainer.ppo.pipeline.pipeline_utils import enhanced_print
 from verl.utils.device import get_torch_device
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
@@ -149,41 +150,17 @@ class MegatronSGLangShardingManager(BaseShardingManager):
             await self.inference_engine.resume_memory_occupation()
         named_tensors = params
 
-        if sgl_update_weights is not None:
-            update_weights_bucket_bytes = int(self.rollout_config.update_weights_bucket_megabytes) << 20
-            for params_batch in get_named_tensor_buckets(named_tensors, update_weights_bucket_bytes):
-                await sgl_update_weights(
-                    engine=self.inference_engine,
-                    params_batch=params_batch,
-                    device_mesh_key="tp",
-                    device_mesh=self.device_mesh,
-                )
-            
-            if self.device_mesh["tp"].get_local_rank() == 0:
-                await self.inference_engine.flush_cache()
+        update_weights_bucket_bytes = int(self.rollout_config.update_weights_bucket_megabytes) << 20
+        for params_batch in get_named_tensor_buckets(named_tensors, update_weights_bucket_bytes):
+            await sgl_update_weights(
+                engine=self.inference_engine,
+                params_batch=params_batch,
+                device_mesh_key="tp",
+                device_mesh=self.device_mesh,
+            )
 
-        else:
-            # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
-            # named_tensors = [(k, v) for k, v in params.items()]
-            named_tensors = params
-            load_format = None
-
-            for tensor_index, (name, tensor) in enumerate(named_tensors):
-                if self.device_mesh["tp"].get_local_rank() == 0:
-                    await self.inference_engine.update_weights_from_tensor_legacy(
-                        named_tensors=[
-                            (
-                                name,
-                                tensor.detach(),
-                            )
-                        ],
-                        load_format=load_format,
-                        flush_cache=False,
-                    )
-
-                if self.device_mesh["tp"].get_local_rank() == 0:
-                    await self.inference_engine.flush_cache()
-
+        if self.device_mesh["tp"].get_local_rank() == 0:
+            await self.inference_engine.flush_cache()
 
     async def release_memory(self):
         if self.device_mesh["tp"].get_local_rank() == 0 and self.rollout_config.free_cache_engine:
@@ -244,11 +221,13 @@ class MegatronSGLangShardingManager(BaseShardingManager):
             return data
         return data.chunk(chunks=self.infer_tp_size)[self.device_mesh["tp"].get_local_rank()]
 
+
 class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
     """
     This class is used to handle the async inference in Megatron SGLang.
     It inherits from MegatronSGLangShardingManager and overrides the wake_up and sleep methods.
     """
+
     def __init__(
         self,
         actor_module: nn.ModuleList,
@@ -268,6 +247,9 @@ class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
         self.model_config = model_config
         self.transformer_config = transformer_config
         self.layer_name_mapping = layer_name_mapping
+        # Initialize offload_param and bridge from parent class
+        self.offload_param = offload_param
+        self.bridge = bridge
         self.weight_converter = weight_converter
         self.device_mesh = device_mesh
 
@@ -288,7 +270,7 @@ class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
             self.gen_random_states = None
 
         self.dual_buffer_engine = None
-        if hasattr(inference_engine, 'update_buffer_data_only'):
+        if hasattr(inference_engine, "update_buffer_data_only"):
             self.dual_buffer_engine = inference_engine
             print(f"[MegatronSGLangAsyncShardingManager] Using dual_buffer_engine: {type(inference_engine)}")
 
@@ -312,7 +294,6 @@ class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.update_weights(per_tensor_param))
 
-
     @GPUMemoryLogger(role="MegatronSGLangAsyncShardingManager enter", logger=logger)
     def __enter__(self):
         self.timing = {}
@@ -327,36 +308,83 @@ class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
 
     def update_weights_sync(self, params):
         """
-        Fully synchronous version of update_weights, avoid using async calls
+        Synchronous version of update_weights
+        Uses the original simple approach that works for first step
         """
         named_tensors = params
-        load_format = None
-        
-        for tensor_index, (name, tensor) in enumerate(named_tensors):
-            if self.device_mesh["tp"].get_local_rank() == 0:
-                if hasattr(self.inference_engine, 'update_weights_from_tensor_sync'):
-                    self.inference_engine.update_weights_from_tensor_sync(
-                        named_tensors=[
-                            (
-                                name,
-                                tensor.detach(),
-                            )
-                        ],
-                        load_format=load_format,
-                        flush_cache=False,
-                    )
-                else:
-                    print(f"Warning: inference_engine has no update_weights_from_tensor_sync method")
 
+        # For NCCL sync mode, we need to process parameters bucket by bucket
+        # to prevent GPU OOM: NCCL sync -> sglang-load (sgl_update_weights)
+        if sgl_update_weights is not None:
+            update_weights_bucket_bytes = int(self.rollout_config.update_weights_bucket_megabytes) << 20
+
+            enhanced_print(
+                "MegatronSGLangAsyncShardingManager",
+                None,
+                f"Processing {len(named_tensors)} tensors in buckets of {update_weights_bucket_bytes} bytes",
+            )
+
+            # Use the simple approach that works for first step
+            loop = asyncio.get_event_loop()
+
+            enhanced_print("MegatronSGLangAsyncShardingManager", None, "Starting weight update process")
+
+            # Process each bucket immediately to avoid GPU OOM
+            for bucket_idx, params_batch in enumerate(
+                get_named_tensor_buckets(named_tensors, update_weights_bucket_bytes)
+            ):
+                enhanced_print(
+                    "MegatronSGLangAsyncShardingManager",
+                    None,
+                    f"Processing bucket {bucket_idx + 1} with {len(params_batch)} tensors",
+                )
+                # Use run_until_complete without timeout - ensure all operations complete
+                loop.run_until_complete(
+                    sgl_update_weights(
+                        engine=self.inference_engine,
+                        params_batch=params_batch,
+                        device_mesh_key="tp",
+                        device_mesh=self.device_mesh,
+                    )
+                )
+                enhanced_print(
+                    "MegatronSGLangAsyncShardingManager", None, f"Successfully processed bucket {bucket_idx + 1}"
+                )
+
+                # Clear the processed bucket from memory immediately
+                # del params_batch
+
+            # Final flush_cache after all buckets are processed
             if self.device_mesh["tp"].get_local_rank() == 0:
-                if hasattr(self.inference_engine, 'flush_cache_sync'):
-                    self.inference_engine.flush_cache_sync()
-                else:
-                    print(f"Warning: inference_engine has no flush_cache_sync method")
+                loop.run_until_complete(self.inference_engine.flush_cache())
+
+            enhanced_print(
+                "MegatronSGLangAsyncShardingManager", None, "Successfully processed all weight update buckets"
+            )
 
     async def update_weights(self, params, use_reqinput=False):
-        # if self.device_mesh["tp"].get_local_rank() == 0:
-        #     await self.inference_engine.resume_memory_occupation()
+        """
+        Update model weights using tensor buckets, similar to THUDM/slime's implementation.
+
+        Notes:
+          - For the best performance of `rebuild_cuda_tensor`, it is recommended to:
+              1. Enable `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`.
+              2. Manually set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
+            when using Tensor Parallelism (TP >= 8).
+          - See reference implementations in SLIME:
+            - Main logic: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L452
+            - runtime envs: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L39
+        """
+        if self.device_mesh["tp"].get_local_rank() == 0 and self.rollout_config.free_cache_engine:
+            await self.inference_engine.resume_memory_occupation()
+        named_tensors = params
+
+        # Notes: for async engine, we use the original simple approach
+
+        # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
+        # named_tensors = [(k, v) for k, v in params.items()]
+        named_tensors = params
+        load_format = None  # Unused variable
 
         if use_reqinput:
             for obj in params:
@@ -364,12 +392,19 @@ class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
                     await self.inference_engine.update_weights_from_reqinput(obj)
                 if self.device_mesh["tp"].get_local_rank() == 0:
                     await self.inference_engine.flush_cache()
-        else:
-            # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
-            # named_tensors = [(k, v) for k, v in params.items()]
-            named_tensors = params
-            load_format = None
+        elif sgl_update_weights is not None:
+            update_weights_bucket_bytes = int(self.rollout_config.update_weights_bucket_megabytes) << 20
+            for params_batch in get_named_tensor_buckets(named_tensors, update_weights_bucket_bytes):
+                await sgl_update_weights(
+                    engine=self.inference_engine,
+                    params_batch=params_batch,
+                    device_mesh_key="tp",
+                    device_mesh=self.device_mesh,
+                )
 
+            if self.device_mesh["tp"].get_local_rank() == 0:
+                await self.inference_engine.flush_cache()
+        else:
             for tensor_index, (name, tensor) in enumerate(named_tensors):
                 if self.device_mesh["tp"].get_local_rank() == 0:
                     await self.inference_engine.update_weights_from_tensor_legacy(
@@ -385,12 +420,8 @@ class MegatronSGLangAsyncShardingManager(MegatronSGLangShardingManager):
 
                 if self.device_mesh["tp"].get_local_rank() == 0:
                     await self.inference_engine.flush_cache()
+
         return True
-
-    async def release_memory(self):
-        if self.device_mesh["tp"].get_local_rank() == 0 and self.rollout_config.free_cache_engine:
-            await self.inference_engine.release_memory_occupation()
-
 
     @GPUMemoryLogger(role="MegatronSGLangAsyncShardingManager enter", logger=logger)
     async def wake_up(self):

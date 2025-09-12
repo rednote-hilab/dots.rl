@@ -18,8 +18,6 @@ import os
 import random
 from collections.abc import Callable
 from dataclasses import asdict
-from dataclasses import is_dataclass
-from argparse import Namespace
 
 import numpy as np
 import torch
@@ -439,7 +437,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 # Save transformer config
                 print(self.transformer_config)
                 transformer_config_dict = asdict(self.transformer_config)
-                from megatron.core.transformer.enums import AttnBackend
+                try:
+                    from megatron.core.transformer.enums import AttnBackend
+                except Exception:
+                    AttnBackend = None
                 to_convert_types = {torch.dtype: str, AttnBackend: str}
                 ignore_types = [Callable]
                 pop_keys = []
